@@ -1,19 +1,20 @@
 ---
 gsd_state_version: "1.0"
 milestone: v1.0
-current_phase: 6
-status: completed
+milestone_name: zoning 全量交付（Phases 1-6）
+status: Awaiting next milestone
 stopped_at: Phase 6 complete — all phases complete
-last_updated: "2026-09-08T07:14:26.731Z"
+last_updated: "2026-09-08T07:25:08.908Z"
 last_activity: 2026-09-08
-last_activity_desc: Phase 6 complete
-state_head: b27a5a0db094647057a58e562788668fd9d1edb7
+last_activity_desc: Milestone v1.0 completed and archived
+state_head: 3d847ee5a1bdf8d1c60ca622637acb3f059126c4
 progress:
   total_phases: 6
   completed_phases: 6
   total_plans: 15
   completed_plans: 15
   percent: 100
+current_phase: 6
 ---
 
 # Project State
@@ -27,12 +28,10 @@ See: .planning/PROJECT.md (updated 2026-09-08)
 
 ## Current Position
 
-Phase: 6
-Plan: Not started
-Status: All phases complete
-Last activity: 2026-09-08 — Phase 6 complete
-
-Progress: [██████████] 100%
+Phase: Milestone v1.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-09-08 — Milestone v1.0 completed and archived
 
 ## Performance Metrics
 
@@ -90,3 +89,7 @@ None yet.
 Last session: 2026-09-08
 Stopped at: Phase 6 complete — all phases complete
 Resume file: None
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd-new-milestone
