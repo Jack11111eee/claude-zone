@@ -57,11 +57,14 @@ Plans:
   3. /zone 命令文件存在且为占位正文（A-2），hook 的 UserPromptSubmit 被触发
   4. 换区持续有效：同会话先 /zone core 后 /zone discuss，档位随最后事件
 
-**Plans**: 2 plans
+**Plans**: 1/2 plans executed
 
 Plans:
 
-- [ ] 02-01: zones/*.yaml 四区定义 + zone show 合并视图 + doctor 校验
+- [x] 02-01-PLAN.md
+- [ ] 02-02-PLAN.md
+
+- [x] 02-01: zones/*.yaml 四区定义 + zone show 合并视图 + doctor 校验
 - [ ] 02-02: UserPromptSubmit hook（/zone 匹配、title 修订、注入、pending 提示）+ /zone skill 文件
 
 ### Phase 3: M2 旗舰 handoff 链路 (= v0.1)
@@ -152,7 +155,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. M0 底座 | 3/3 | Complete    | 2026-09-08 |
-| 2. M1 注入 | 0/2 | Not started | - |
+| 2. M1 注入 | 1/2 | In Progress|  |
 | 3. M2 旗舰 handoff | 0/4 | Not started | - |
 | 4. M3 护栏 | 0/2 | Not started | - |
 | 5. M4 其余链路 | 0/2 | Not started | - |
