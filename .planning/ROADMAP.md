@@ -129,11 +129,14 @@ Plans:
   3. `zone gc` 移动 14 天 stale 文档至 .trash/（不删除；moved N, kept M）
   4. 三链路模板选择 = 表名矩阵（§6.3）自动按 from×to 路由
 
-**Plans**: 2 plans
+**Plans**: 1/2 plans executed
 
 Plans:
 
-- [ ] 05-01: zone snapshot（git 分支拓扑+log 摘要纯机器产物）+ gc
+- [x] 05-01-PLAN.md
+- [ ] 05-02-PLAN.md
+
+- [x] 05-01: zone snapshot（git 分支拓扑+log 摘要纯机器产物）+ gc
 - [ ] 05-02: 链路模板路由（升级链 Why Escalated、收尾链指令）+ /handoff 参数化
 
 ### Phase 6: M5 巡视与糖 (= v1.0)
@@ -166,5 +169,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 2. M1 注入 | 2/2 | Complete    | 2026-09-08 |
 | 3. M2 旗舰 handoff | 4/4 | Complete    | 2026-09-08 |
 | 4. M3 护栏 | 2/2 | Complete    | 2026-09-08 |
-| 5. M4 其余链路 | 0/2 | Not started | - |
+| 5. M4 其余链路 | 1/2 | In Progress|  |
 | 6. M5 巡视与糖 | 0/2 | Not started | - |
