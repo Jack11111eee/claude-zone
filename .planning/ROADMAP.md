@@ -14,7 +14,7 @@
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
 - [x] **Phase 1: M0 底座** - SessionStart hook + `zone` bin 骨架 + sidecar 索引（ZONE-01/03, STORE-01） (completed 2026-09-08)
-- [ ] **Phase 2: M1 注入** - 四区 zone prompt 定稿注入 + /zone 补救路径（PROMPT-01~03）
+- [x] **Phase 2: M1 注入** - 四区 zone prompt 定稿注入 + /zone 补救路径（PROMPT-01~03） (completed 2026-09-08)
 - [ ] **Phase 3: M2 旗舰 handoff 链路** - discuss→core 全链路 + 存储一致性（HANDOFF-01~05, STORE-02/04, ZONE-02）= v0.1
 - [ ] **Phase 4: M3 护栏** - discuss 锁 Write/Edit、maint 拦高危 git、判区联动（GUARD-01~04）
 - [ ] **Phase 5: M4 其余链路** - 升级链（Why Escalated）+ 收尾链（机器 Snapshot）+ gc（HANDOFF-06/07, STORE-03）
@@ -65,7 +65,7 @@ Plans:
 - [x] 02-02-PLAN.md
 
 - [x] 02-01: zones/*.yaml 四区定义 + zone show 合并视图 + doctor 校验
-- [ ] 02-02: UserPromptSubmit hook（/zone 匹配、title 修订、注入、pending 提示）+ /zone skill 文件
+- [x] 02-02: UserPromptSubmit hook（/zone 匹配、title 修订、注入、pending 提示）+ /zone skill 文件
 
 ### Phase 3: M2 旗舰 handoff 链路 (= v0.1)
 
@@ -155,7 +155,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. M0 底座 | 3/3 | Complete    | 2026-09-08 |
-| 2. M1 注入 | 2/2 | In Progress|  |
+| 2. M1 注入 | 2/2 | Complete    | 2026-09-08 |
 | 3. M2 旗舰 handoff | 0/4 | Not started | - |
 | 4. M3 护栏 | 0/2 | Not started | - |
 | 5. M4 其余链路 | 0/2 | Not started | - |

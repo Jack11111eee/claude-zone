@@ -15,9 +15,9 @@ Requirements for initial release (v1.0 = M0~M5). Each maps to roadmap phases. �
 
 ### Prompt Injection（区身份）
 
-- [ ] **PROMPT-01**: 启动主路径会话获得对应区 zone prompt（经 SessionStart hookSpecificOutput.additionalContext）
-- [ ] **PROMPT-02**: 会话内 `/zone <zone>` 经 UserPromptSubmit hook 换区：写 title、追加索引事件、注入 zone prompt、提示未消费 handoff
-- [ ] **PROMPT-03**: /zone 命令文件存在（占位正文），保证 slash 输入触发 UserPromptSubmit（V-5 实测前提）
+- [x] **PROMPT-01**: 启动主路径会话获得对应区 zone prompt（经 SessionStart hookSpecificOutput.additionalContext）
+- [x] **PROMPT-02**: 会话内 `/zone <zone>` 经 UserPromptSubmit hook 换区：写 title、追加索引事件、注入 zone prompt、提示未消费 handoff
+- [x] **PROMPT-03**: /zone 命令文件存在（占位正文），保证 slash 输入触发 UserPromptSubmit（V-5 实测前提）
 
 ### Handoff（交接链路）
 
@@ -71,9 +71,9 @@ Requirements for initial release (v1.0 = M0~M5). Each maps to roadmap phases. �
 | ZONE-01 | Phase 1 (M0) | Complete |
 | ZONE-02 | Phase 3 (M3) | Pending |
 | ZONE-03 | Phase 1 (M0) | Complete |
-| PROMPT-01 | Phase 2 (M1) | Pending |
-| PROMPT-02 | Phase 2 (M1) | Pending |
-| PROMPT-03 | Phase 2 (M1) | Pending |
+| PROMPT-01 | Phase 2 (M1) | Complete |
+| PROMPT-02 | Phase 2 (M1) | Complete |
+| PROMPT-03 | Phase 2 (M1) | Complete |
 | HANDOFF-01 | Phase 3 (M2) | Pending |
 | HANDOFF-02 | Phase 3 (M2) | Pending |
 | HANDOFF-03 | Phase 3 (M2) | Pending |
