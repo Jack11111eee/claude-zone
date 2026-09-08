@@ -1,7 +1,7 @@
 {
   "contract": "1.0.0",
   "flavor": "core",
-  "milestone": "v1.0 — zoning 全量交付（Phases 1-6）",
+  "milestone": "v1.1",
   "phases": [
     {
       "number": "1",
@@ -15,7 +15,7 @@
     },
     {
       "number": "3",
-      "name": "M2 旗舰 handoff",
+      "name": "M2 handoff",
       "status": "complete"
     },
     {
@@ -25,19 +25,19 @@
     },
     {
       "number": "5",
-      "name": "M4 其余链路",
+      "name": "M4 链路",
       "status": "complete"
     },
     {
       "number": "6",
-      "name": "M5 巡视与糖",
+      "name": "M5 巡视",
       "status": "complete"
     }
   ],
   "next": {
-    "command": "/gsd:progress",
-    "label": "Show progress",
-    "reason": "Unsure of state — showing progress"
+    "command": "/gsd:discuss-phase",
+    "label": "Discuss the first phase",
+    "reason": "Project initialized — plan your first phase"
   },
-  "updated_at": "2026-09-08T07:25:08.948Z"
+  "updated_at": "2026-09-08T07:53:53.527Z"
 }

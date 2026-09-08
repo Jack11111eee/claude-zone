@@ -21,9 +21,11 @@ zoning 是一个 Claude Code 插件，为同一项目的会话引入「功能分
 - ✓ 三入口：cz() 糖（主路径）、/zone 补救、/zones 巡视 — v1.0
 - ✓ 24/24 条 v1 需求（ZONE/PROMPT/HANDOFF/GUARD/REVIEW/STORE 六族）全部实现并逐条验收 — v1.0（各 phase VERIFICATION + 里程碑档案）
 
-### Active
+### Active — v1.1 收尾与加固
 
-(None — v1.0 shipped; next milestone not yet planned)
+- [ ] zone 文案单源收敛：hook LABELS 硬编码 → 从 zones/*.yaml `display` 读取（消除双词表漂移）
+- [ ] SessionEnd hook 落地：轻量 lastSeen append 事件（DESIGN §9 表格「轻量更新 lastSeen」行，v1.0 留 stub）
+- [ ] Bash 正则加固：§8.2 七条正则补非常规形态（`git clean -Xfd`、双空格 `git  clean`）
 
 ### Out of Scope
 
@@ -67,5 +69,22 @@ zoning 是一个 Claude Code 插件，为同一项目的会话引入「功能分
 | 垂直切片 6 phase 各配真会话验收（M0~M5 每片一个 E2E 证据） | 声称「作品牌可验收」就要每片都真验收——M3 拒绝文案、M4 R-2 自愈全被真会话撞见过 | ✓ Good（六片全过） |
 | handoff 最终路径直写 + harness Write 守卫兜底（Bash+python3） | M-1 原子写不可让；兜底写进 skill 文档 | ✓ Good（M2/M4 真会话均走通） |
 
+## Evolution
+
+This document evolves at phase transitions and milestone boundaries.
+
+**After each phase transition** (via `/gsd-transition`):
+1. Requirements invalidated? → Move to Out of Scope with reason
+2. Requirements validated? → Move to Validated with phase reference
+3. New requirements emerged? → Add to Active
+4. Decisions to log? → Add to Key Decisions
+5. "What This Is" still accurate? → Update if drifted
+
+**After each milestone** (via `/gsd:complete-milestone`):
+1. Full review of all sections
+2. Core Value check — still the right priority?
+3. Audit Out of Scope — reasons still valid?
+4. Update Context with current state
+
 ---
-*Last updated: 2026-09-08 after v1.0 milestone*
+*Last updated: 2026-09-08, v1.1 started (收尾与加固)*
