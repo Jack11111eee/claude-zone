@@ -109,7 +109,7 @@ created 可用
 | discuss → core | **默认重点**：Decisions + Open Questions + 范围边界（在 Decisions 末条明示「做什么、不做什么」） |
 | chore → core / chore → discuss（升级） | Why Escalated（为什么超纲）+ Snapshot（改到哪了） |
 | core → discuss（执行中暴雷回炉） | Open Questions 以 Blocked By + 具体问题清单为主；Decisions 记已试过与已排除的 |
-| core → maint（收尾） | Snapshot：先跑 `zone snapshot`，输出原样嵌入（纯机器产物，不经改写）。注：snapshot 尚未实装（M4），不可用时手写 git 分支拓扑 + log 摘要 |
+| core → maint（收尾） | Snapshot：先运行 `zone snapshot`，输出原样嵌入本段（纯机器产物，不加评论、不改写） |
 | 其他（含 from: unzoned） | 就近套用最接近的一行 |
 
 ## 写作纪律

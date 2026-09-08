@@ -30,13 +30,18 @@
        该区合并定义 guards.bash_block_patterns（§8.2 L-6 七条正则 list，
        含 --force 负向前瞻（后面不再跟非空白字符）——--force-with-lease
        保护性操作放行）逐条 re.search on command 字符串 → 命中 deny
-其余子命令（snapshot/gc）仅声明骨架，后续 plan 填实。
+05-01：`snapshot`（§5 M-2：git 现场块——branch/porcelain/log -5/分支
+       清单四小节，纯机器产物，非 git 目录优雅降级单行）+ `gc`
+       （§6.4 B-3：created 起算 stale_days 天过期即移入 handoffs/.trash/，
+       不论 pending 与否；shutil.move 永不 unlink，同名冲突加 -1/-2 尾缀）。
 """
 
 import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import unicodedata
 from datetime import datetime, timedelta
@@ -1815,15 +1820,127 @@ def _check_guard_bash(args):
     return _guard_output(args, {"decision": "allow", "zone": zone})
 
 
-def make_stub(cmd_name):
-    def stub(args):
-        return fail(
-            cmd_name,
-            f"not implemented: `{cmd_name}` 在本 phase 仅声明（01-02/01-03 填实）",
-            EXIT_USAGE,
-            getattr(args, "json", False),
+# ---------------------------------------------------------------------------
+# snapshot（§5 M-2）：core→maint 收尾链的现场块，纯机器产物
+#
+#   subprocess 调 git（--no-pager，项目 cwd）取四项事实：当前分支 /
+#   porcelain dirty 清单 / 最近 5 条 log / 全分支清单——拼 markdown 块
+#   （## Snapshot + 四小节），零 LLM 加工，/handoff 指令原样嵌入。
+#   非 git 目录（git 命令失败/非零）→ 单行 'Snapshot: 非 git 仓库'。
+# ---------------------------------------------------------------------------
+
+def _git(args_list, cwd=None):
+    """跑一条 git 子命令 → (stdout 文本, ok)；非零/找不到 git → ("", False)。"""
+    try:
+        proc = subprocess.run(
+            ["git", "--no-pager"] + args_list,
+            capture_output=True, text=True, cwd=cwd,
         )
-    return stub
+    except OSError:  # git 不在 PATH 等
+        return "", False
+    if proc.returncode != 0:
+        return "", False
+    return proc.stdout, True
+
+
+def _snapshot_body(cwd=None):
+    """git 现场块全文（非 git 仓库 → 'Snapshot: 非 git 仓库' 单行）。"""
+    branch, ok = _git(["branch", "--show-current"], cwd)
+    if not ok:
+        return "Snapshot: 非 git 仓库"
+    branch = branch.strip() or "(detached HEAD)"
+    status_out, _ = _git(["status", "--porcelain"], cwd)
+    log_out, _ = _git(["log", "--oneline", "-5"], cwd)
+    branches_out, _ = _git(["branch", "-a", "--format=%(refname:short)"], cwd)
+
+    status_lines = [ln for ln in status_out.splitlines() if ln.strip()]
+    log_lines = [ln.strip() for ln in log_out.splitlines() if ln.strip()]
+    branch_lines = [ln.strip() for ln in branches_out.splitlines() if ln.strip()]
+
+    lines = ["## Snapshot", "",
+             "### 当前分支", "", f"{branch}", "",
+             "### 未提交改动（porcelain）", ""]
+    lines.extend(status_lines if status_lines else ["（无）"])
+    lines.append("")
+    lines.extend(["### 最近提交（log -5）", ""])
+    lines.extend(log_lines if log_lines else ["（无）"])
+    lines.append("")
+    lines.extend(["### 分支清单（branch -a）", ""])
+    lines.extend(branch_lines if branch_lines else ["（无）"])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_snapshot(args):
+    body = _snapshot_body(os.getcwd())
+    if args.json:
+        return emit_ok("snapshot", {"body": body})
+    sys.stdout.write(body)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# gc（§6.4 B-3 / §7.1 .trash）：stale 文档移入 handoffs/.trash/，永不删除
+#
+#   扫描四区目录全部 .md → parse_frontmatter 取 created → 判过期：
+#   created + stale_days 天 < now（B-3 语义：以 created 起算，不论
+#   pending 与否——过期即移）→ shutil.move 到 handoffs/.trash/
+#   （同名冲突加尾缀 -1/-2）。绝不删除（无任何 unlink 调用；手工清空
+#   trash 是人的事）。stale_days 沿用 _scan_handoff_files 跳过坏文件
+#   的口径：解析失败的文档不属于本命令的事，doctor 报告。
+# ---------------------------------------------------------------------------
+
+def _trash_dedupe_path(trash_dir, filename):
+    """.trash/ 内目标路径：同名冲突在去扩展名后加 -1/-2 尾缀（.md 保留）。"""
+    base, ext = os.path.splitext(filename)
+    candidate = os.path.join(trash_dir, filename)
+    n = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(trash_dir, f"{base}-{n}{ext}")
+        n += 1
+    return candidate
+
+
+def cmd_gc(args):
+    cwd = os.getcwd()
+    now = datetime.now().astimezone()
+    root = handoffs_dir(cwd)
+
+    moved, kept = 0, 0
+    trash_dir = os.path.join(root, ".trash")
+    for zone in ZONES:
+        zdir = os.path.join(root, zone)
+        if not os.path.isdir(zdir):
+            continue
+        for entry in sorted(os.listdir(zdir)):
+            if not entry.endswith(".md"):
+                continue
+            path = os.path.join(zdir, entry)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    fm, _body = parse_frontmatter(fh.read())
+            except (FrontmatterError, OSError):
+                continue  # 解析失败的文件：不动（doctor 范围），宁可堆积不可误移
+            created = fm.get("created")
+            stale = False
+            try:
+                stale = datetime.fromisoformat(created) + timedelta(days=args.stale_days) < now
+            except (TypeError, ValueError):
+                stale = False  # created 缺失/非法：视为未过期（显示层不翻车口径）
+            if not stale:
+                kept += 1
+                continue
+            os.makedirs(trash_dir, exist_ok=True)  # 分目录新建而 .trash/ 未建时防 move 吞目录
+            dest = _trash_dedupe_path(trash_dir, entry)
+            shutil.move(path, dest)
+            moved += 1
+
+    if args.json:
+        return emit_ok("gc", {"moved": moved, "kept": kept})
+    print(f"moved {moved}, kept {kept}")
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------------------
@@ -1894,7 +2011,7 @@ def build_parser():
     p.set_defaults(func=cmd_register)
 
     p = add("snapshot", "生成 core→maint 收尾链的现场块（纯机器产物）")
-    p.set_defaults(func=make_stub("snapshot"))
+    p.set_defaults(func=cmd_snapshot)
 
     p = add("inject", "打印 handoff 全文并标记 consumed")
     p.add_argument("id", help="handoff id（如 ho-20260907-a1b2）")
@@ -1906,7 +2023,7 @@ def build_parser():
     p = add("gc", "stale 文档移入 handoffs/.trash/")
     p.add_argument("--stale-days", type=int, default=14, metavar="N",
                    help="stale 阈值天数（缺省 14）")
-    p.set_defaults(func=make_stub("gc"))
+    p.set_defaults(func=cmd_gc)
 
     p = add("doctor", "校验 zone 定义与存储一致性（目录 × 索引 × 坏行）")
     p.set_defaults(func=cmd_doctor)
