@@ -19,6 +19,9 @@
 03-02：pending 双源查询（§7.4：目录扫描 ∩ 索引状态）+ list 的 handoff
        全量视图（目录行状态回填、孤儿 (unregistered)、幽灵如实列、stale
        按 §6.4 B-3 渲染时派生——created 起算 14 天，不写事件）。
+03-03：doctor 一致性检查（§7.4 孤儿/幽灵/命名错位三类 + §7.2 L-2 索引
+       坏行报告；read_events 坏行收集扩为 {line, raw} 供 doctor 消费，
+       其余读取方不受影响——只报告，不修复，机器不猜状态）。
 其余子命令（snapshot/gc）仅声明骨架，后续 plan 填实。
 """
 
@@ -184,7 +187,9 @@ def append_event(cwd, event):
 def read_events(cwd):
     """重放 index.jsonl：逐行 json.loads，坏行跳过收集（doctor 消费）。
 
-    返回 (events, skipped)；坏行序号从 1 起。
+    返回 (events, skipped)；skipped 项形如 {"line": N, "raw": "<原行文本>"}
+    （行号从 1 起，空行不计）。which/list/pending/inject 等读取方忽略
+    skipped（L-2 容忍），doctor 将其落为问题条目（03-03）。
     """
     path = index_path(cwd)
     events, skipped = [], []
@@ -198,12 +203,12 @@ def read_events(cwd):
             try:
                 obj = json.loads(line)
             except ValueError:
-                skipped.append(lineno)
+                skipped.append({"line": lineno, "raw": line})
                 continue
             if isinstance(obj, dict):
                 events.append(obj)
             else:
-                skipped.append(lineno)
+                skipped.append({"line": lineno, "raw": line})
     return events, skipped
 
 
@@ -1016,7 +1021,8 @@ def doctor_problems(repo_root=None):
     """doctor 数据采集（附录 A data={problems:[{file,field,message}]}）。
 
     (a) 四内置定义逐一解析+字段校验；(b) repo 覆盖层第五区名 → P-6 警告；
-    (c) 覆盖层未知字段 → B-6 错误条目。孤儿/幽灵/索引一致性属 03-03，不做。
+    (c) 覆盖层未知字段 → B-6 错误条目。（03-03 起存储一致性三类与索引坏行
+    检查在 _consistency_problems，与本函数并列拼装。）
     """
     repo_root = os.getcwd() if repo_root is None else repo_root
     problems = []
@@ -1050,6 +1056,76 @@ def doctor_problems(repo_root=None):
         #（即 show 输出、hook 读入的最终形态），部分覆盖不产生虚假缺失项。
         merged = _deep_merge(builtins.get(entry[:-len(".yaml")], {}), data)
         problems.extend(_value_problems(merged, rel))
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# doctor 一致性检查（§7.4 三类 + §7.2 L-2 坏行；03-03）
+#
+#   孤儿：handoffs/ 有文件但索引无该 id 登记事件（模型写了但 register
+#         失败/漏调）→ 提醒人 re-register，不代办（H-3 机器不猜状态）。
+#   幽灵：索引状态 pending/re_consumed 但文件不存在（人手删/移动）→
+#         报告；inject 遇它 exit 3。consumed 豁免（文档可能已被 gc 移入
+#         .trash 或人工归档，正常现象，不误报）。
+#   命名错位：文件所在目录名 ≠ frontmatter.to → 报告（metadata 以
+#         frontmatter 为准，不影响读取）。
+#   索引坏行：read_events 收集的损坏行（L-2 并发 append 碰撞）→ 报告
+#         行号+摘要，不崩。
+#
+# 全部只报告不修复：孤儿修复靠人执行 zone register（机器不猜状态），
+# 索引的保底重建走 reindex 内部重放逻辑（区内部实现，不暴露 CLI）。
+# ---------------------------------------------------------------------------
+
+def _consistency_problems(cwd, events, skipped):
+    """存储一致性检查（§7.4）+ 索引坏行（L-2）→ problems 列表。
+
+    数据源复用：目录侧 _scan_handoff_files（含 frontmatter 与所在目录），
+    索引侧 _replay_handoffs（合并现值），读写两端同一套函数——doctor 与
+    pending/list/inject 看到同一个世界。
+    """
+    problems = []
+    states = _replay_handoffs(events)
+    disk_rows = _scan_handoff_files(cwd)
+    ids_on_disk = {row["id"] for row in disk_rows}
+
+    for row in disk_rows:  # 单次扫描喂孤儿与命名错位两类
+        hid = row["id"]
+        if hid not in states:
+            problems.append({
+                "file": os.path.join("handoffs", row["_zone_dir"], f"{hid}.md"),
+                "field": hid,
+                "message": "孤儿：未登记。修复：zone register <file>"
+                           "（人确认后执行，机器不猜状态）",
+            })
+        to = row["to"]
+        if to is not None and to != row["_zone_dir"]:
+            problems.append({
+                "file": os.path.join("handoffs", row["_zone_dir"], f"{hid}.md"),
+                "field": "to",
+                "message": f"命名错位：frontmatter.to={to} 但文件在 "
+                           f"{row['_zone_dir']}/ 目录"
+                           "（metadata 以 frontmatter 为准，不影响读取）",
+            })
+
+    for hid, state in sorted(states.items()):
+        if hid in ids_on_disk:
+            continue  # 文件在（无论哪个目录）：幽灵不成立
+        status = state.get("status") or "pending"
+        if status not in ("pending", "re_consumed"):
+            continue  # consumed 豁免：可能已被 gc 移 .trash 或人工归档
+        problems.append({
+            "file": os.path.join("handoffs", state.get("to") or "?", f"{hid}.md"),
+            "field": hid,
+            "message": f"幽灵：有登记无文件（status: {status}）。inject 将 exit 3",
+        })
+
+    for item in skipped:  # L-2 坏行（read_events 收集，此处消费）
+        prefix = str(item.get("raw", ""))[:40]
+        problems.append({
+            "file": "index.jsonl",
+            "field": f"line {item.get('line', '?')}",
+            "message": f"损坏行跳过：{prefix}...",
+        })
     return problems
 
 
@@ -1121,7 +1197,9 @@ def cmd_show(args):
 
 
 def cmd_doctor(args):
-    problems = doctor_problems()
+    cwd = os.getcwd()
+    events, skipped = read_events(cwd)
+    problems = doctor_problems(cwd) + _consistency_problems(cwd, events, skipped)
     if args.json:
         return emit_ok("doctor", {"problems": problems})
     if not problems:
@@ -1637,7 +1715,7 @@ def build_parser():
                    help="stale 阈值天数（缺省 14）")
     p.set_defaults(func=make_stub("gc"))
 
-    p = add("doctor", "校验 zone 定义与覆盖层合法性")
+    p = add("doctor", "校验 zone 定义与存储一致性（目录 × 索引 × 坏行）")
     p.set_defaults(func=cmd_doctor)
 
     p = add("show", "某区定义的最终合并视图")
