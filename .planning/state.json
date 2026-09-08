@@ -1,43 +1,33 @@
 {
   "contract": "1.0.0",
   "flavor": "core",
-  "milestone": "v1.1",
+  "milestone": "v1.1 — 收尾与加固（Phases 7-10）",
   "phases": [
     {
-      "number": "1",
-      "name": "M0 底座",
-      "status": "complete"
+      "number": "7",
+      "name": "单源收敛",
+      "status": "pending"
     },
     {
-      "number": "2",
-      "name": "M1 注入",
-      "status": "complete"
+      "number": "8",
+      "name": "SessionEnd",
+      "status": "pending"
     },
     {
-      "number": "3",
-      "name": "M2 handoff",
-      "status": "complete"
+      "number": "9",
+      "name": "护栏加固",
+      "status": "pending"
     },
     {
-      "number": "4",
-      "name": "M3 护栏",
-      "status": "complete"
-    },
-    {
-      "number": "5",
-      "name": "M4 链路",
-      "status": "complete"
-    },
-    {
-      "number": "6",
-      "name": "M5 巡视",
-      "status": "complete"
+      "number": "10",
+      "name": "发布收口",
+      "status": "pending"
     }
   ],
   "next": {
-    "command": "/gsd:discuss-phase",
-    "label": "Discuss the first phase",
-    "reason": "Project initialized — plan your first phase"
+    "command": "/gsd:progress --next",
+    "label": "Advance to the next step",
+    "reason": "Phase 7 of 4 · 0% · executing"
   },
-  "updated_at": "2026-09-08T07:53:53.527Z"
+  "updated_at": "2026-09-08T07:56:42.259Z"
 }
