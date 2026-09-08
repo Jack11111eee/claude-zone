@@ -1,5 +1,17 @@
 # Milestones
 
+## v1.1 收尾与加固 (Shipped: 2026-09-08)
+
+**Phases completed:** 4 phases, 4 plans, 16 tasks
+
+**Key accomplishments:**
+
+- SessionEnd lastSeen 落地：stub → 实装，last-wins 复用使 list/doctor 零改动（真会话全链实证）。
+- 护栏加固：三组矩阵 24 断言全绿 + 真会话 maint 拦截实证。bin 逻辑零改动（正则纯数据层）。
+- 发布收口完成：1.1.0 着床（真实安装路径验证）+ 三抽查真会话全绿。
+
+---
+
 ## v1.0 zoning 全量交付 (Shipped: 2026-09-08)
 
 **Phases completed:** 6 phases, 15 plans, 27 tasks
