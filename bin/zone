@@ -26,6 +26,10 @@
        定义 deny_write_edit → allow_paths glob carve-out 自实现，
        ** 跨段 / * 段内 / 其余字面——纯 stdlib fnmatch 不够；GUARD-03
        degrade-to-open：无会话 id / 未登记 unzoned 一律放行，exit 恒 0）。
+04-02：`_check-guard bash`（§9 PreToolUse Bash 行 + GUARD-02/04：判区同构，
+       该区合并定义 guards.bash_block_patterns（§8.2 L-6 七条正则 list，
+       含 --force 负向前瞻（后面不再跟非空白字符）——--force-with-lease
+       保护性操作放行）逐条 re.search on command 字符串 → 命中 deny
 其余子命令（snapshot/gc）仅声明骨架，后续 plan 填实。
 """
 
@@ -1713,6 +1717,21 @@ def normalize_path(path):
     return re.sub(r"/{2,}", "/", path)
 
 
+def _guard_resolve_zone(args):
+    """guard 共用判区（§7.3 by sessionId；GUARD-03 degrade-to-open）。
+
+    返回 (zone or None, cwd)。无会话 id / 未登记 → None（调用方按 unzoned
+    放行，源真相在索引，不从 cwd 推断）。
+    """
+    cwd = os.getcwd()
+    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not session_id:
+        return None, cwd
+    events, _ = read_events(cwd)
+    ev = replay_sessions(events).get(session_id)
+    return (ev.get("zone") if ev else None), cwd
+
+
 def _guard_output(args, data):
     """决策输出：--json 走附录 A data={decision,zone,pattern?}（04-01）。"""
     if args.json:
@@ -1725,22 +1744,30 @@ def _guard_output(args, data):
 
 
 def cmd_check_guard(args):
-    """`_check-guard write`：一次 Write/Edit 的 allow/deny 判定（GUARD-01/03）。"""
-    if args.action != "write":
-        return fail("_check-guard",
-                    f"未知 guard 动作：{args.action}（当前仅 write；bash 在 04-02）",
-                    EXIT_USAGE, args.json)
-    cwd = os.getcwd()
-    path = normalize_path(args.path)
+    """`_check-guard <action>`：一次工具调用的 allow/deny 判定（GUARD-01..04）。
 
-    # GUARD-03 前半：连会话 id 都没有 → 无从判区 → 放行（degrade-to-open）
-    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
-    zone = None
-    if session_id:
-        events, _ = read_events(cwd)
-        ev = replay_sessions(events).get(session_id)
-        if ev:
-            zone = ev.get("zone")
+    write（04-01）：deny_write_edit → allow_paths glob 豁免。
+    bash（04-02）：bash_block_patterns 逐条 re.search → 命中 deny 带模式。
+    链路共用：判区 by sessionId → 合并定义（Q-4）→ 区 guards 求值，
+    GUARD-03 degrade-to-open（无会话 id / 未登记 unzoned 一律放行），
+    exit 恒 0（决策走数据；仅用法错 exit 2、定义不可用 exit 4）。
+    """
+    if args.action == "write":
+        if not args.path:
+            return fail("_check-guard", "action=write 需要 --path <p>", EXIT_USAGE, args.json)
+        return _check_guard_write(args)
+    if args.action == "bash":
+        if args.command is None:
+            return fail("_check-guard", "action=bash 需要 --command <s>", EXIT_USAGE, args.json)
+        return _check_guard_bash(args)
+    return fail("_check-guard",
+                f"未知 guard 动作：{args.action}（当前支持 write / bash）",
+                EXIT_USAGE, args.json)
+
+
+def _check_guard_write(args):
+    zone, cwd = _guard_resolve_zone(args)
+    path = normalize_path(args.path)
 
     if zone not in ZONES:  # 未登记 / 无会话 id → unzoned，GUARD-03 后半
         return _guard_output(args, {"decision": "allow", "zone": "unzoned"})
@@ -1757,6 +1784,35 @@ def cmd_check_guard(args):
         if isinstance(pattern, str) and match_glob(pattern, path):
             return _guard_output(args, {"decision": "allow", "zone": zone})
     return _guard_output(args, {"decision": "deny", "zone": zone, "pattern": path})
+
+
+def _check_guard_bash(args):
+    """`_check-guard bash --command <s>`（04-02，GUARD-02/04）。
+
+    bash_block_patterns（正则 list，§8.2 L-6）逐条 re.search on command
+    字符串——黑名单只拦已知危险形态，不枚举安全命令；空列表 → 自然 allow。
+    """
+    zone, cwd = _guard_resolve_zone(args)
+    command = args.command
+
+    if zone not in ZONES:  # 未登记 / 无会话 id → unzoned，GUARD-03（非 maint 不查）
+        return _guard_output(args, {"decision": "allow", "zone": "unzoned"})
+
+    try:
+        guards = (load_zone_def(zone, cwd) or {}).get("guards") or {}
+    except ZoneDefError as exc:
+        return fail("_check-guard", f"区定义不可用（{exc}）", EXIT_BAD_DEF, args.json)
+
+    for pattern in guards.get("bash_block_patterns") or []:
+        if isinstance(pattern, str):
+            try:
+                matched = re.search(pattern, command)
+            except re.error:  # 定义坏正则：跳过该条，不因一条坏全线崩（doctor 范围）
+                continue
+            if matched:
+                return _guard_output(args, {
+                    "decision": "deny", "zone": zone, "pattern": pattern})
+    return _guard_output(args, {"decision": "allow", "zone": zone})
 
 
 def make_stub(cmd_name):
@@ -1812,9 +1868,11 @@ def build_parser():
     p = sub.add_parser("_check-guard", parents=[json_flag],
                        help="（内部命令，hook 使用）")
     p.add_argument("action", metavar="action",
-                   help="guard 动作（write；bash 在 04-02）")
-    p.add_argument("--path", required=True,
-                   help="Write/Edit 的目标文件路径（tool_input.file_path）")
+                   help="guard 动作（write / bash）")
+    p.add_argument("--path",
+                   help="Write/Edit 的目标文件路径（action=write 必填）")
+    p.add_argument("--command",
+                   help="Bash 的命令字符串（action=bash 必填）")
     p.add_argument("--session", help="会话 id（缺省取 CLAUDE_CODE_SESSION_ID）")
     p.set_defaults(func=cmd_check_guard)
 
