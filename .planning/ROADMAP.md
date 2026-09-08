@@ -15,7 +15,7 @@
 
 - [x] **Phase 1: M0 底座** - SessionStart hook + `zone` bin 骨架 + sidecar 索引（ZONE-01/03, STORE-01） (completed 2026-09-08)
 - [x] **Phase 2: M1 注入** - 四区 zone prompt 定稿注入 + /zone 补救路径（PROMPT-01~03） (completed 2026-09-08)
-- [ ] **Phase 3: M2 旗舰 handoff 链路** - discuss→core 全链路 + 存储一致性（HANDOFF-01~05, STORE-02/04, ZONE-02）= v0.1
+- [x] **Phase 3: M2 旗舰 handoff 链路** - discuss→core 全链路 + 存储一致性（HANDOFF-01~05, STORE-02/04, ZONE-02）= v0.1 (completed 2026-09-08)
 - [ ] **Phase 4: M3 护栏** - discuss 锁 Write/Edit、maint 拦高危 git、判区联动（GUARD-01~04）
 - [ ] **Phase 5: M4 其余链路** - 升级链（Why Escalated）+ 收尾链（机器 Snapshot）+ gc（HANDOFF-06/07, STORE-03）
 - [ ] **Phase 6: M5 巡视与糖** - /zones 总览 + cz() 糖 + README = v1.0（REVIEW-01~03）
@@ -80,19 +80,19 @@ Plans:
   4. `zone pending` 列表与目录∩索引双源一致：孤儿 (unregistered) 如实标注；幽灵 exit 3
   5. 上游 handoff 链路确认 fake frontmatter 时 register 拒绝且提示模型修复（闭环留模型侧）
 
-**Plans**: 3/4 plans executed
+**Plans**: 4/4 plans complete
 
 Plans:
 
 - [x] 03-01-PLAN.md
 - [x] 03-02-PLAN.md
 - [x] 03-03-PLAN.md
-- [ ] 03-04-PLAN.md
+- [x] 03-04-PLAN.md
 
 - [x] 03-01: handoff schema + register/inject（frontmatter 校验、生命周期事件、--force 语义）
 - [x] 03-02: pending 双源查询（目录扫描∩索引状态、stale 派生、孤儿标注）
-- [ ] 03-03: doctor（四区定义校验 + 孤儿/幽灵/命名错位 + 索引损坏行容忍）
-- [ ] 03-04: /handoff skill + discuss_to_core 模板 + SessionStart/UPS pending 探测提示行
+- [x] 03-03: doctor（四区定义校验 + 孤儿/幽灵/命名错位 + 索引损坏行容忍）
+- [x] 03-04: /handoff skill + discuss_to_core 模板 + SessionStart/UPS pending 探测提示行
 
 ### Phase 4: M3 护栏
 
@@ -161,7 +161,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 |-------|----------------|--------|-----------|
 | 1. M0 底座 | 3/3 | Complete    | 2026-09-08 |
 | 2. M1 注入 | 2/2 | Complete    | 2026-09-08 |
-| 3. M2 旗舰 handoff | 3/4 | In Progress|  |
+| 3. M2 旗舰 handoff | 4/4 | Complete    | 2026-09-08 |
 | 4. M3 护栏 | 0/2 | Not started | - |
 | 5. M4 其余链路 | 0/2 | Not started | - |
 | 6. M5 巡视与糖 | 0/2 | Not started | - |
