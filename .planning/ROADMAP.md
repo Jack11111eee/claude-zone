@@ -80,12 +80,12 @@ Plans:
   4. `zone pending` 列表与目录∩索引双源一致：孤儿 (unregistered) 如实标注；幽灵 exit 3
   5. 上游 handoff 链路确认 fake frontmatter 时 register 拒绝且提示模型修复（闭环留模型侧）
 
-**Plans**: 1/4 plans executed
+**Plans**: 2/4 plans executed
 
 Plans:
 
 - [x] 03-01-PLAN.md
-- [ ] 03-02-PLAN.md
+- [x] 03-02-PLAN.md
 - [ ] 03-03-PLAN.md
 - [ ] 03-04-PLAN.md
 
@@ -161,7 +161,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 |-------|----------------|--------|-----------|
 | 1. M0 底座 | 3/3 | Complete    | 2026-09-08 |
 | 2. M1 注入 | 2/2 | Complete    | 2026-09-08 |
-| 3. M2 旗舰 handoff | 1/4 | In Progress|  |
+| 3. M2 旗舰 handoff | 2/4 | In Progress|  |
 | 4. M3 护栏 | 0/2 | Not started | - |
 | 5. M4 其余链路 | 0/2 | Not started | - |
 | 6. M5 巡视与糖 | 0/2 | Not started | - |
