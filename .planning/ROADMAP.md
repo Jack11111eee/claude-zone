@@ -16,7 +16,7 @@
 - [x] **Phase 1: M0 底座** - SessionStart hook + `zone` bin 骨架 + sidecar 索引（ZONE-01/03, STORE-01） (completed 2026-09-08)
 - [x] **Phase 2: M1 注入** - 四区 zone prompt 定稿注入 + /zone 补救路径（PROMPT-01~03） (completed 2026-09-08)
 - [x] **Phase 3: M2 旗舰 handoff 链路** - discuss→core 全链路 + 存储一致性（HANDOFF-01~05, STORE-02/04, ZONE-02）= v0.1 (completed 2026-09-08)
-- [ ] **Phase 4: M3 护栏** - discuss 锁 Write/Edit、maint 拦高危 git、判区联动（GUARD-01~04）
+- [x] **Phase 4: M3 护栏** - discuss 锁 Write/Edit、maint 拦高危 git、判区联动（GUARD-01~04） (completed 2026-09-08)
 - [ ] **Phase 5: M4 其余链路** - 升级链（Why Escalated）+ 收尾链（机器 Snapshot）+ gc（HANDOFF-06/07, STORE-03）
 - [ ] **Phase 6: M5 巡视与糖** - /zones 总览 + cz() 糖 + README = v1.0（REVIEW-01~03）
 
@@ -107,15 +107,15 @@ Plans:
   4. unzoned 会话（无前缀、无 /zone）→ 一切放行（零打扰）
   5. 判区 by sessionId（同 repo 双终端不同区互不串扰）
 
-**Plans**: 1/2 plans executed
+**Plans**: 2/2 plans complete
 
 Plans:
 
 - [x] 04-01-PLAN.md
-- [ ] 04-02-PLAN.md
+- [x] 04-02-PLAN.md
 
 - [x] 04-01: PreToolUse Write/Edit hook（deny_write_edit + allow_paths glob 匹配）
-- [ ] 04-02: PreToolUse Bash hook（bash_block_patterns 正则、判区 by sessionId、maint 黑名单）
+- [x] 04-02: PreToolUse Bash hook（bash_block_patterns 正则、判区 by sessionId、maint 黑名单）
 
 ### Phase 5: M4 其余链路
 
@@ -165,6 +165,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 1. M0 底座 | 3/3 | Complete    | 2026-09-08 |
 | 2. M1 注入 | 2/2 | Complete    | 2026-09-08 |
 | 3. M2 旗舰 handoff | 4/4 | Complete    | 2026-09-08 |
-| 4. M3 护栏 | 1/2 | In Progress|  |
+| 4. M3 护栏 | 2/2 | Complete    | 2026-09-08 |
 | 5. M4 其余链路 | 0/2 | Not started | - |
 | 6. M5 巡视与糖 | 0/2 | Not started | - |

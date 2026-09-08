@@ -21,7 +21,7 @@
     {
       "number": "4",
       "name": "M3 护栏",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "number": "5",
@@ -36,8 +36,8 @@
   ],
   "next": {
     "command": "/gsd:progress --next",
-    "label": "Advance to the next step",
-    "reason": "Phase 4 of 6 · executing"
+    "label": "Advance to the next step (plan phase 05)",
+    "reason": "Phase 05 of 6 — needs a plan"
   },
-  "updated_at": "2026-09-08T06:02:48.652Z"
+  "updated_at": "2026-09-08T06:34:46.244Z"
 }

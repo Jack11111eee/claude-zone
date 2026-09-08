@@ -31,10 +31,10 @@ Requirements for initial release (v1.0 = M0~M5). Each maps to roadmap phases. �
 
 ### Guards（护栏）
 
-- [ ] **GUARD-01**: discuss 区 deny_write_edit=true，allow_paths=["**/handoffs/**"] 放行 handoff 写入
-- [ ] **GUARD-02**: maint 区 deny_write_edit=true，allow_paths 增 `.gitignore`+`**/.claude/zones/**`；bash_block_patterns 拦 7 类高危 git 形态
-- [ ] **GUARD-03**: PreToolUse 判区 by sessionId 索引；未登记会话全放行（degrade-to-open）
-- [ ] **GUARD-04**: maint 区欣赏性例外：`--force-with-lease` 不拦（保护性操作）
+- [x] **GUARD-01**: discuss 区 deny_write_edit=true，allow_paths=["**/handoffs/**"] 放行 handoff 写入
+- [x] **GUARD-02**: maint 区 deny_write_edit=true，allow_paths 增 `.gitignore`+`**/.claude/zones/**`；bash_block_patterns 拦 7 类高危 git 形态
+- [x] **GUARD-03**: PreToolUse 判区 by sessionId 索引；未登记会话全放行（degrade-to-open）
+- [x] **GUARD-04**: maint 区欣赏性例外：`--force-with-lease` 不拦（保护性操作）
 
 ### Review & Sugar（巡视与糖）
 
@@ -81,10 +81,10 @@ Requirements for initial release (v1.0 = M0~M5). Each maps to roadmap phases. �
 | HANDOFF-05 | Phase 3 (M2) | Complete |
 | HANDOFF-06 | Phase 5 (M4) | Pending |
 | HANDOFF-07 | Phase 5 (M4) | Pending |
-| GUARD-01 | Phase 4 (M3) | Pending |
-| GUARD-02 | Phase 4 (M3) | Pending |
-| GUARD-03 | Phase 4 (M3) | Pending |
-| GUARD-04 | Phase 4 (M3) | Pending |
+| GUARD-01 | Phase 4 (M3) | Complete |
+| GUARD-02 | Phase 4 (M3) | Complete |
+| GUARD-03 | Phase 4 (M3) | Complete |
+| GUARD-04 | Phase 4 (M3) | Complete |
 | REVIEW-01 | Phase 6 (M5) | Pending |
 | REVIEW-02 | Phase 6 (M5) | Pending |
 | REVIEW-03 | Phase 6 (M5) | Pending |
