@@ -18,7 +18,7 @@
 - [x] **Phase 3: M2 旗舰 handoff 链路** - discuss→core 全链路 + 存储一致性（HANDOFF-01~05, STORE-02/04, ZONE-02）= v0.1 (completed 2026-09-08)
 - [x] **Phase 4: M3 护栏** - discuss 锁 Write/Edit、maint 拦高危 git、判区联动（GUARD-01~04） (completed 2026-09-08)
 - [x] **Phase 5: M4 其余链路** - 升级链（Why Escalated）+ 收尾链（机器 Snapshot）+ gc（HANDOFF-06/07, STORE-03） (completed 2026-09-08)
-- [ ] **Phase 6: M5 巡视与糖** - /zones 总览 + cz() 糖 + README = v1.0（REVIEW-01~03）
+- [x] **Phase 6: M5 巡视与糖** - /zones 总览 + cz() 糖 + README = v1.0（REVIEW-01~03） (completed 2026-09-08)
 
 ## Phase Details
 
@@ -151,12 +151,15 @@ Plans:
   3. handoff 写完时的深链输出格式 `claude-cli://open?q=/zone core&cwd=<abs>` 正确（URL 编码）
   4. 全部 24 条 v1 需求验收通过 = v1.0 tag
 
-**Plans**: 2 plans
+**Plans**: 2/2 plans complete
 
 Plans:
 
-- [ ] 06-01: /zones skill（渲染 zone list、等号形式命令、深链）
-- [ ] 06-02: README（理念、cz() 糖、威慑非沙箱声明、装法）
+- [x] 06-01-PLAN.md
+- [x] 06-02-PLAN.md
+
+- [x] 06-01: /zones skill（渲染 zone list、等号形式命令、深链）
+- [x] 06-02: README（理念、cz() 糖、威慑非沙箱声明、装法）
 
 ## Progress
 
@@ -170,4 +173,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 3. M2 旗舰 handoff | 4/4 | Complete    | 2026-09-08 |
 | 4. M3 护栏 | 2/2 | Complete    | 2026-09-08 |
 | 5. M4 其余链路 | 2/2 | Complete    | 2026-09-08 |
-| 6. M5 巡视与糖 | 0/2 | Not started | - |
+| 6. M5 巡视与糖 | 2/2 | Complete    | 2026-09-08 |

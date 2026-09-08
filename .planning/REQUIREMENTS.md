@@ -38,9 +38,9 @@ Requirements for initial release (v1.0 = M0~M5). Each maps to roadmap phases. �
 
 ### Review & Sugar（巡视与糖）
 
-- [ ] **REVIEW-01**: /zones 巡视命令：按区分组（最近会话+未消费 handoff），给用户的复制命令一律等号形式 `--resume="--core x"`
-- [ ] **REVIEW-02**: README 含理念、cz() 糖（zone→model 映射）、威慑非沙箱声明
-- [ ] **REVIEW-03**: 深链输出 `claude-cli://open?q=/zone core&cwd=...` 格式正确（H-2 修正确版）
+- [x] **REVIEW-01**: /zones 巡视命令：按区分组（最近会话+未消费 handoff），给用户的复制命令一律等号形式 `--resume="--core x"`
+- [x] **REVIEW-02**: README 含理念、cz() 糖（zone→model 映射）、威慑非沙箱声明
+- [x] **REVIEW-03**: 深链输出 `claude-cli://open?q=/zone core&cwd=...` 格式正确（H-2 修正确版）
 
 ### Storage & Consistency（存储一致性）
 
@@ -85,9 +85,9 @@ Requirements for initial release (v1.0 = M0~M5). Each maps to roadmap phases. �
 | GUARD-02 | Phase 4 (M3) | Complete |
 | GUARD-03 | Phase 4 (M3) | Complete |
 | GUARD-04 | Phase 4 (M3) | Complete |
-| REVIEW-01 | Phase 6 (M5) | Pending |
-| REVIEW-02 | Phase 6 (M5) | Pending |
-| REVIEW-03 | Phase 6 (M5) | Pending |
+| REVIEW-01 | Phase 6 (M5) | Complete |
+| REVIEW-02 | Phase 6 (M5) | Complete |
+| REVIEW-03 | Phase 6 (M5) | Complete |
 | STORE-01 | Phase 1 (M0) | Complete |
 | STORE-02 | Phase 3 (M2) | Complete |
 | STORE-03 | Phase 5 (M4) | Complete |
