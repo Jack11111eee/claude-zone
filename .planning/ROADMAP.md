@@ -34,16 +34,16 @@
   3. 不带前缀的 `claude` 会话：零打扰（无提示、无索引事件）
   4. `zone which/list/title --json` 返回规范 JSON（附录 A 契约）
 
-**Plans**: 2/3 plans executed
+**Plans**: 3/3 plans executed
 
 Plans:
 
 - [x] 01-01-PLAN.md
-- [ ] 01-02-PLAN.md
+- [x] 01-02-PLAN.md
 - [x] 01-03-PLAN.md
 - [x] 01-01: 插件脚手架 + zone bin 基础（plugin.json、hooks.json、bin/zone argparse 骨架、title 解析）
 - [ ] 01-02: SessionStart hook（subagent 跳过 L-1、前缀解析、索引登记、stdout 提示）
-- [ ] 01-03: sidecar 索引（index.jsonl 追加、title/which/list 渲染、--json 契约）
+- [x] 01-03: sidecar 索引（index.jsonl 追加、title/which/list 渲染、--json 契约）
 
 ### Phase 2: M1 注入
 
@@ -151,7 +151,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. M0 底座 | 2/3 | In Progress|  |
+| 1. M0 底座 | 3/3 | In Progress|  |
 | 2. M1 注入 | 0/2 | Not started | - |
 | 3. M2 旗舰 handoff | 0/4 | Not started | - |
 | 4. M3 护栏 | 0/2 | Not started | - |
