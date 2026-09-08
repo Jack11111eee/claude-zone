@@ -63,6 +63,8 @@ Recent decisions affecting current work:
 - [init]: DESIGN.md v1.2 是唯一权威，全部实现细节照它办
 - [init]: GSD 流程在分类器故障环境下由 orchestrator 直接执行（产物格式对齐规范）
 - [init]: skip_discuss=true（设计已六轮收敛，无灰区待讨论）
+- [01-01]: maint push 正则加负向前瞻 --force(?!\S)，否则误伤 --force-with-lease（L-6 注释明言放行）
+- [01-01]: bin/zone 加 ZONING_HOME 环境变量支持（测试隔离需要——索引默认 ~/.claude/zoning，验收测试须用临时目录）
 
 ### Pending Todos
 
