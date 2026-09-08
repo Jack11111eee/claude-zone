@@ -6,7 +6,7 @@
     {
       "number": "7",
       "name": "单源收敛",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "number": "8",
@@ -26,8 +26,8 @@
   ],
   "next": {
     "command": "/gsd:progress --next",
-    "label": "Advance to the next step",
-    "reason": "Phase 7 of 4 · 0% · executing"
+    "label": "Advance to the next step (plan phase 08)",
+    "reason": "Phase 08 of 4 — needs a plan"
   },
-  "updated_at": "2026-09-08T07:56:42.259Z"
+  "updated_at": "2026-09-08T08:45:46.487Z"
 }

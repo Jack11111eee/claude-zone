@@ -11,7 +11,7 @@
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
-- [ ] **Phase 7: 单源收敛** - hook LABELS 硬编码收敛到 zones/*.yaml display 单源（CONSOL-01/02）
+- [x] **Phase 7: 单源收敛** - hook LABELS 硬编码收敛到 zones/*.yaml display 单源（CONSOL-01/02） (completed 2026-09-08)
 - [ ] **Phase 8: SessionEnd lastSeen** - 会话结束轻量事件补全，zone list 相对时间活化（SESS-01/02）
 - [ ] **Phase 9: Bash 护栏加固** - §8.2 非常规形态补齐 + 测试矩阵固化（GUARD-05/06）
 - [ ] **Phase 10: v1.1 发布收口** - 版本语义化 1.0.0→1.1.0、marketplace 升级核查（PACK-01/02）= v1.1 tag
@@ -31,6 +31,8 @@
   4. 既有 hook 验收测试全过（无回归）
 
 **Plans**: TBD（预计 1-2 plans）
+
+- [x] 07-01-PLAN.md
 
 ### Phase 8: SessionEnd lastSeen
 
@@ -80,7 +82,7 @@ Phases execute in numeric order: 7 → 8 → 9 → 10
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 7. 单源收敛 | 0/? | Not started | - |
+| 7. 单源收敛 | 1/1 | Complete    | 2026-09-08 |
 | 8. SessionEnd | 0/? | Not started | - |
 | 9. 护栏加固 | 0/? | Not started | - |
 | 10. 发布收口 | 0/? | Not started | - |
