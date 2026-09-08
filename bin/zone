@@ -13,7 +13,10 @@
        Q-4 深合并）+ `doctor`（内置定义校验 / P-6 第五区 / B-6 未知字段）。
 02-02：内部子命令 `_zone-prompt`（prompt 从合并定义取全文）+ `_zap-title`
        （/zone 换区：transcript 首条用户消息取名 M-3 + source:command 事件）。
-其余子命令（pending/register/snapshot/inject/gc）仅声明骨架，后续 plan 填实。
+03-01：handoff 生命周期引擎（§6.2 frontmatter 受限解析 + register 校验登记
+       M-1 写入=登记原子、无移动语义 + inject 消费 R-5 --force→re_consumed、
+       幽灵 exit 3、B-1 跨区允许）。
+其余子命令（pending/snapshot/gc）仅声明骨架，后续 plan 填实。
 """
 
 import argparse
@@ -139,6 +142,11 @@ def zoning_dir(cwd):
 
 def index_path(cwd):
     return os.path.join(zoning_dir(cwd), "index.jsonl")
+
+
+def handoffs_dir(cwd):
+    """cwd -> 该项目 handoffs/ 根目录（§7.1；register 前缀校验 / inject 定位用）。"""
+    return os.path.join(zoning_dir(cwd), "handoffs")
 
 
 def ensure_layout(cwd):
@@ -1072,11 +1080,291 @@ def cmd_doctor(args):
 
 
 # ---------------------------------------------------------------------------
+# handoff 生命周期引擎（§6.2 / §5 R-2·R-5 / §6.4 / §6.5）
+#
+#   register：<file> 校验 frontmatter 合法 → 索引登记 pending（M-1 无移动
+#             语义——文档已按 §6.2 直接写在最终路径，写入=登记原子，R-2）。
+#             重复 register 为安全 no-op（幂等，exit 0 + already 提示）。
+#   inject：<id> 查索引生命周期 → 打印全文 + consumed 事件（调用即消费）。
+#             已 consumed 默认拒绝 exit 3（R-5），--force 追加 re_consumed
+#             （状态不回退，P-4）。跨区消费允许（B-1：handoff 只是上下文包，
+#             by 如实记）。幽灵（有登记无文件）exit 3（§7.4）。
+#
+# frontmatter 为受限 flat 键值（§6.2 schema v1）：--- 分隔，值语法复用
+# zones yaml 受限标量（_parse_scalar）；tags 列表项为纯标量。子集外形态
+# （嵌套值 / 流式集合 / tab）抛 FrontmatterError，register 消费为 exit 2。
+# ---------------------------------------------------------------------------
+
+_HANDOFF_ID_RE = re.compile(r"^ho-\d{8}-[0-9a-z]{4}$")
+HANDOFF_FROM_ZONES = ZONES + ("unzoned",)  # L-3：from 允许 unzoned（来源不设限）
+_HEADING_RE = re.compile(r"^#(?!#)\s+(.+?)\s*$")
+
+
+class FrontmatterError(Exception):
+    """handoff frontmatter 解析失败（§6.2）；register 消费为 exit 2。"""
+
+
+def _fm_scalar(token, lineno):
+    """frontmatter 标量：复用 zones yaml 受限标量，错误统一为 FrontmatterError。"""
+    try:
+        return _parse_scalar(token, lineno)
+    except ZoneDefError as exc:
+        raise FrontmatterError(str(exc)) from None
+
+
+def parse_frontmatter(text):
+    """文档全文 -> (frontmatter dict, 正文行列表)。
+
+    §6.2：首行 `---` 至下一个 `---` 为机器层（flat 键值 + tags 列表），
+    之后 `# 标题` 起是人机共享层。子集外形态（键缩进 / 流式集合语法 /
+    列表项嵌套值 / 空值非列表）抛 FrontmatterError（受限解析器：明确报错
+    好过静默错读）。
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise FrontmatterError("第 1 行必须是 frontmatter 分隔符 `---`（§6.2）")
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        raise FrontmatterError("frontmatter 未闭合（缺结束 `---`）")
+
+    fm = {}
+    i = 1
+    while i < end:
+        raw = lines[i]
+        content = raw.strip()
+        lineno = i + 1
+        if not content or content.startswith("#"):
+            i += 1
+            continue
+        if raw[:1] in (" ", "\t"):
+            raise FrontmatterError(
+                f"第 {lineno} 行：frontmatter 只支持 flat 键值（发现缩进/嵌套）")
+        key, sep, rest = content.partition(":")
+        key = key.strip()
+        if not sep or not key:
+            raise FrontmatterError(
+                f"第 {lineno} 行：无法解析（期望 key: value）：{content[:40]}")
+        if key in fm:
+            raise FrontmatterError(f"第 {lineno} 行：键重复：{key}")
+        i += 1
+        rest = rest.strip()
+        if rest:
+            fm[key] = _fm_scalar(rest, lineno)
+            continue
+        # 值为空：期待 `- item` 列表（允许更深缩进；空行/注释行跳过）
+        items = []
+        while i < end:
+            item = lines[i].strip()
+            if not item or item.startswith("#"):
+                i += 1
+                continue
+            if not item.startswith("- "):
+                break
+            token = item[2:].strip()
+            if not token:
+                raise FrontmatterError(
+                    f"第 {i + 1} 行：列表项为空（期望 - item）")
+            if ": " in token or token.endswith(":"):
+                raise FrontmatterError(
+                    f"第 {i + 1} 行：列表项不支持嵌套值（期望纯标量 tag）：{item[:40]}")
+            items.append(_fm_scalar(token, i + 1))
+            i += 1
+        if not items:
+            raise FrontmatterError(
+                f"第 {lineno} 行：{key} 为空值（期待 `- item` 列表或 `[]`）")
+        fm[key] = items
+    return fm, lines[end + 1:]
+
+
+def validate_handoff_fm(fm):
+    """frontmatter dict -> 错误清单（§5 R-2：id/from/to/created 存在且合法）。
+
+    空清单 = 合法。tags 预留不消费（§6.2）；from 允许 unzoned（L-3），
+    to 必须是四区之一（文档落 handoffs/<to>/ 下）。
+    """
+    errors = []
+    hid = fm.get("id")
+    if hid is None:
+        errors.append("缺 id（形如 ho-20260907-a1b2）")
+    elif not isinstance(hid, str) or not _HANDOFF_ID_RE.match(hid):
+        errors.append(f"id 非法：{hid!r}（须形如 ho-<yyyymmdd>-<4位小写字母数字>）")
+    source = fm.get("from")
+    if source is None:
+        errors.append(f"缺 from（允许：{'/'.join(HANDOFF_FROM_ZONES)}）")
+    elif source not in HANDOFF_FROM_ZONES:
+        errors.append(f"from 非法：{source!r}（允许：{'/'.join(HANDOFF_FROM_ZONES)}）")
+    dest = fm.get("to")
+    if dest is None:
+        errors.append(f"缺 to（四区：{'/'.join(ZONES)}，文档应位于 handoffs/<to>/ 下）")
+    elif dest not in ZONES:
+        errors.append(f"to 非法：{dest!r}（四区封闭集合：{'/'.join(ZONES)}，to 不允许 unzoned）")
+    created = fm.get("created")
+    if created is None:
+        errors.append("缺 created（ISO8601，如 2026-09-07T17:20:00+08:00）")
+    elif not isinstance(created, str):
+        errors.append(f"created 非法：须为 ISO8601 字符串（得到 {type(created).__name__}）")
+    else:
+        try:
+            datetime.fromisoformat(created)
+        except ValueError:
+            errors.append(f"created 非法：无法按 ISO8601 解析（得到 {created!r}）")
+    return errors
+
+
+def _handoff_title(body_lines, hid):
+    """正文首个 # 一级标题 -> 事件 title（无则回退 id）。"""
+    for line in body_lines:
+        m = _HEADING_RE.match(line)
+        if m:
+            return m.group(1)
+    return hid
+
+
+def _handoff_event(hid, status, session_id, subtype):
+    """状态迁移事件（§7.2）：不携带 from/to/title，只迁移 status/by/subtype。"""
+    return {
+        "v": 1,
+        "ts": now_iso(),
+        "type": "handoff",
+        "id": hid,
+        "status": status,
+        "by": session_id,
+        "subtype": subtype,
+    }
+
+
+def cmd_register(args):
+    """zone register <file>（§5：校验通过才 append——写入=登记原子）。"""
+    cwd = os.getcwd()
+
+    # (1) 存在性
+    if not os.path.isfile(args.file):
+        return fail("register", f"文件不存在：{args.file}", EXIT_USAGE, args.json)
+
+    # (2) 路径防跨项目：resolve 后前缀校验（须在本项目 sidecar 的 handoffs/ 树内）
+    real_file = os.path.realpath(args.file)
+    real_root = os.path.realpath(handoffs_dir(cwd))
+    try:
+        inside = os.path.commonpath([real_file, real_root]) == real_root
+    except ValueError:  # 零重叠路径（理论防御）
+        inside = False
+    if not inside:
+        return fail(
+            "register",
+            f"文件不在本项目 handoffs 树内：{real_file}（应为 {real_root}/<to>/<id>.md，"
+            "防跨项目误登记，§7.1）",
+            EXIT_USAGE, args.json)
+
+    # (3) frontmatter 解析 + 字段校验（§6.2 schema v1）
+    try:
+        with open(real_file, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return fail("register", f"文件不可读：{exc}", EXIT_USAGE, args.json)
+    try:
+        fm, body_lines = parse_frontmatter(text)
+    except FrontmatterError as exc:
+        return fail("register", f"frontmatter 解析失败：{exc}", EXIT_USAGE, args.json)
+    errors = validate_handoff_fm(fm)
+    if errors:
+        return fail("register", "frontmatter 校验失败：" + "；".join(errors)
+                    + "——修复文档后重新 register（闭环在模型侧，R-2）",
+                    EXIT_USAGE, args.json)
+
+    hid = fm["id"]
+
+    # (4) 幂等：id 已在索引（任意状态）→ 安全 no-op
+    events, _ = read_events(cwd)
+    if hid in _replay_handoffs(events):
+        if args.json:
+            return emit_ok("register", {"id": hid, "path": real_file, "already": True})
+        print(f"zone: {hid} 已登记过（重复 register 是安全 no-op；"
+              f"消费请用 zone inject {hid}）", file=sys.stderr)
+        return EXIT_OK
+
+    # (5) 登记：append pending 事件（无移动语义，M-1；title 取正文 # 一级标题）
+    event = {
+        "v": 1,
+        "ts": now_iso(),
+        "type": "handoff",
+        "id": hid,
+        "from": fm["from"],
+        "to": fm["to"],
+        "status": "pending",
+        "title": _handoff_title(body_lines, hid),
+    }
+    append_event(cwd, event)
+
+    if args.json:
+        return emit_ok("register", {"id": hid, "path": real_file})
+    print(f"registered {hid}")
+    return EXIT_OK
+
+
+def _inject_output(args, state, status, body):
+    """inject 成功输出：--json 全量 data；否则打印文档全文。"""
+    if args.json:
+        return emit_ok("inject", {
+            "id": args.id,
+            "from": state.get("from"),
+            "to": state.get("to"),
+            "status": status,
+            "body": body,
+        })
+    sys.stdout.write(body)
+    return EXIT_OK
+
+
+def cmd_inject(args):
+    """zone inject <id> [--force]（§6.5：调用即消费；R-5：--force 逃生门）。"""
+    cwd = os.getcwd()
+
+    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not session_id:
+        return fail("inject", "缺少会话 id：--session <id> 或环境变量 CLAUDE_CODE_SESSION_ID",
+                    EXIT_USAGE, args.json)
+
+    # 索引重放：该 id 的合并状态（无事件 → exit 3）
+    events, _ = read_events(cwd)
+    state = _replay_handoffs(events).get(args.id)
+    if state is None:
+        return fail("inject", f"handoff 不在索引（未 register？）：{args.id}",
+                    EXIT_NOT_FOUND, args.json)
+
+    status = state.get("status")
+    if status != "pending" and not args.force:
+        return fail("inject",
+                    f"handoff {args.id} 已消费（status: {status}），状态不回退（P-4）——"
+                    f"重读全文请用 zone inject {args.id} --force",
+                    EXIT_NOT_FOUND, args.json)
+
+    # 全文：读 handoffs/<to>/<id>.md（幽灵=有登记无文件 → exit 3，§7.4）
+    path = os.path.join(handoffs_dir(cwd), state.get("to") or "", f"{args.id}.md")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError:
+        return fail("inject", f"幽灵 handoff：索引有 {args.id} 的登记但文件不存在（{path}）",
+                    EXIT_NOT_FOUND, args.json)
+
+    if status == "pending":
+        append_event(cwd, _handoff_event(args.id, "consumed", session_id, "inject"))
+        return _inject_output(args, state, "consumed", body)
+
+    # consumed/re_consumed + --force：追加 re_consumed（跨区允许，B-1：by 如实记）
+    append_event(cwd, _handoff_event(args.id, "re_consumed", session_id, "inject --force"))
+    return _inject_output(args, state, "re_consumed", body)
+
+
+# ---------------------------------------------------------------------------
 # 未实现子命令（本 plan 只声明，exit 2）
 # ---------------------------------------------------------------------------
 
-NOT_IMPLEMENTED = ("pending", "register", "snapshot",
-                   "inject", "gc")
+NOT_IMPLEMENTED = ("pending", "snapshot", "gc")
 
 
 def make_stub(cmd_name):
@@ -1144,7 +1432,7 @@ def build_parser():
 
     p = add("register", "校验 frontmatter 合法并登记索引")
     p.add_argument("file", help="handoff 文档路径")
-    p.set_defaults(func=make_stub("register"))
+    p.set_defaults(func=cmd_register)
 
     p = add("snapshot", "生成 core→maint 收尾链的现场块（纯机器产物）")
     p.set_defaults(func=make_stub("snapshot"))
@@ -1153,7 +1441,8 @@ def build_parser():
     p.add_argument("id", help="handoff id（如 ho-20260907-a1b2）")
     p.add_argument("--force", action="store_true",
                    help="已 consumed 文档的逃生门（追加 re_consumed 事件）")
-    p.set_defaults(func=make_stub("inject"))
+    p.add_argument("--session", help="消费会话 id（缺省取 CLAUDE_CODE_SESSION_ID）")
+    p.set_defaults(func=cmd_inject)
 
     p = add("gc", "stale 文档移入 handoffs/.trash/")
     p.add_argument("--stale-days", type=int, default=14, metavar="N",
