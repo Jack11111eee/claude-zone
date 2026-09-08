@@ -26,7 +26,7 @@
     {
       "number": "5",
       "name": "M4 其余链路",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "number": "6",
@@ -36,8 +36,8 @@
   ],
   "next": {
     "command": "/gsd:progress --next",
-    "label": "Advance to the next step",
-    "reason": "Phase 5 of 6 · executing"
+    "label": "Advance to the next step (plan phase 06)",
+    "reason": "Phase 06 of 6 — needs a plan"
   },
-  "updated_at": "2026-09-08T06:34:46.759Z"
+  "updated_at": "2026-09-08T07:01:36.381Z"
 }

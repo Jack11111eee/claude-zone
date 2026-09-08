@@ -26,8 +26,8 @@ Requirements for initial release (v1.0 = M0~M5). Each maps to roadmap phases. �
 - [x] **HANDOFF-03**: `zone inject <id>` 打印全文并标记 consumed；已消费默认拒绝 + `--force` 逃生门（re_consumed 追加事件，status 不回退）
 - [x] **HANDOFF-04**: 目标区启动/换区时提示未消费 handoff 列表（提示≠注入，人确认）
 - [x] **HANDOFF-05**: discuss→core 链路（旗舰，=v0.1）：Decisions+Open Questions+范围边界模板走通
-- [ ] **HANDOFF-06**: 升级链（chore→core/discuss，Why Escalated + Snapshot 模板）
-- [ ] **HANDOFF-07**: 收尾链（core→maint，Snapshot 由 `zone snapshot` 纯机器生成原样嵌入）
+- [x] **HANDOFF-06**: 升级链（chore→core/discuss，Why Escalated + Snapshot 模板）
+- [x] **HANDOFF-07**: 收尾链（core→maint，Snapshot 由 `zone snapshot` 纯机器生成原样嵌入）
 
 ### Guards（护栏）
 
@@ -46,7 +46,7 @@ Requirements for initial release (v1.0 = M0~M5). Each maps to roadmap phases. �
 
 - [x] **STORE-01**: 本地 `~/.claude/zoning/<project-slug>/`：index.jsonl append-only 事件流（v:1）+ handoffs/<to>/<id>.md + .trash/
 - [x] **STORE-02**: pending 真值 = 目录扫描 ∩ 索引状态（H-3）：孤儿、幽灵、命名错位三类一致性检查入 doctor
-- [ ] **STORE-03**: `zone gc` stale（created 起算 14 天）移入 .trash/（移动不删除）；
+- [x] **STORE-03**: `zone gc` stale（created 起算 14 天）移入 .trash/（移动不删除）；
 - [x] **STORE-04**: index 损坏行 doctor 容忍跳过并报告（并发 append 场景，L-2）
 
 ## v2 Requirements
@@ -79,8 +79,8 @@ Requirements for initial release (v1.0 = M0~M5). Each maps to roadmap phases. �
 | HANDOFF-03 | Phase 3 (M2) | Complete |
 | HANDOFF-04 | Phase 3 (M2) | Complete |
 | HANDOFF-05 | Phase 3 (M2) | Complete |
-| HANDOFF-06 | Phase 5 (M4) | Pending |
-| HANDOFF-07 | Phase 5 (M4) | Pending |
+| HANDOFF-06 | Phase 5 (M4) | Complete |
+| HANDOFF-07 | Phase 5 (M4) | Complete |
 | GUARD-01 | Phase 4 (M3) | Complete |
 | GUARD-02 | Phase 4 (M3) | Complete |
 | GUARD-03 | Phase 4 (M3) | Complete |
@@ -90,7 +90,7 @@ Requirements for initial release (v1.0 = M0~M5). Each maps to roadmap phases. �
 | REVIEW-03 | Phase 6 (M5) | Pending |
 | STORE-01 | Phase 1 (M0) | Complete |
 | STORE-02 | Phase 3 (M2) | Complete |
-| STORE-03 | Phase 5 (M4) | Pending |
+| STORE-03 | Phase 5 (M4) | Complete |
 | STORE-04 | Phase 3 (M2) | Complete |
 
 **Coverage:**
