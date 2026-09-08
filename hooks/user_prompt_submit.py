@@ -10,6 +10,9 @@ SessionStart) via `zone pending` — the hook never scans directories itself.
 stdout is a single JSON line — the ready line is folded INTO additionalContext,
 never printed bare. All other prompts (plain messages, `/zone` without args,
 `/zone inject ho-xzy`) fall through silently — hooks don't scout normal chat.
+Ready-line wording is single-sourced from zones/*.yaml `display` (07-01):
+the same `zone _zone-prompt` response carries it next to the prompt — this
+hook only appends the 区 suffix, never maps zone→label itself.
 """
 import json
 import os
@@ -18,7 +21,6 @@ import subprocess
 import sys
 
 ZONE_ARGS = {"chore", "core", "discuss", "maint"}
-LABELS = {"chore": "杂活区", "core": "核心区", "discuss": "讨论区", "maint": "版本维护区"}
 ZONE_RE = re.compile(r"^/zone\s+(\S+)$")
 
 
@@ -79,13 +81,14 @@ def main():
         if not zt.get("ok") or not zp.get("ok"):
             return  # bad transcript paths degrade silently — zone title/gen unzoned stays plain CC
         zone_prompt = zp.get("data", {}).get("prompt")
+        display = zp.get("data", {}).get("display")
     except (OSError, ValueError):
         return
-    if not zone_prompt:
+    if not zone_prompt or not display:
         return
     # Pending probe lives in `zone pending` (M-3/M-5); hook only formats the hint
     hint = format_pending_hint(probe_pending(root, zone, payload.get("cwd")))
-    ctx = f"{LABELS[zone]}已就绪。\n{zone_prompt}" + (f"\n{hint}" if hint else "")
+    ctx = f"{display}区已就绪。\n{zone_prompt}" + (f"\n{hint}" if hint else "")
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit", "additionalContext": ctx,
     }}, ensure_ascii=False))

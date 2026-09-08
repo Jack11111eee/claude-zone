@@ -8,14 +8,15 @@ session_id, then translates a deny into the official PreToolUse decision JSON
 (permissionDecision/permissionDecisionReason inside hookSpecificOutput).
 Missing path / zone bin failure → allow (degrade-to-open: the guard must never
 break writes, it only deters zoned sessions from editing source). allow →
-silent exit 0.
+silent exit 0. Deny-reason wording is single-sourced from zones/*.yaml
+`display` (07-01) via `zone _check-guard`'s display field — this hook only
+appends the 区 suffix, falling back to the raw zone name when display is
+absent (degrade-to-open spirit: wording must not create a failure path).
 """
 import json
 import os
 import subprocess
 import sys
-
-LABELS = {"chore": "杂活区", "core": "核心区", "discuss": "讨论区", "maint": "版本维护区"}
 
 
 def main():
@@ -44,7 +45,8 @@ def main():
     if verdict.get("decision") != "deny":
         return
     zone = verdict.get("zone")
-    reason = f"{LABELS.get(zone, zone)}护栏：本区禁止修改源码。请用 /handoff 交接或 /zone 换区。写 handoff 文档不受限。"
+    label = f"{verdict.get('display') or zone}区"
+    reason = f"{label}护栏：本区禁止修改源码。请用 /handoff 交接或 /zone 换区。写 handoff 文档不受限。"
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",

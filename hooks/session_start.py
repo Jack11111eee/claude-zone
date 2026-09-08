@@ -10,13 +10,14 @@ scans directories itself). stdout must be a single JSON line — the
 human-readable ready line is folded INTO additionalContext's leading line (any
 bare line before the JSON breaks Claude's stdout-as-JSON parsing).
 unzoned sessions stay zero-output (§3: silent plain CC).
+Ready-line wording is single-sourced from zones/*.yaml `display` (07-01):
+`zone _zone-prompt` carries it alongside the prompt — this hook only appends
+the 区 suffix, never maps zone→label itself.
 """
 import json
 import os
 import subprocess
 import sys
-
-LABELS = {"chore": "杂活区", "core": "核心区", "discuss": "讨论区", "maint": "版本维护区"}
 
 
 def run_zone(root, argv, stdin_text=None):
@@ -74,17 +75,19 @@ def main():
         data = run_zone(root, ["_register-session"],
                         json.dumps({**payload, "source": "prefix"})).get("data", {})
         zone = data.get("zone")
-        if zone not in LABELS:  # unzoned → zero output (§3: silent plain CC)
+        if not zone or zone == "unzoned":  # unzoned → zero output (§3: silent plain CC)
             return
-        prompt = run_zone(root, ["_zone-prompt", zone]).get("data", {}).get("prompt")
+        zp = run_zone(root, ["_zone-prompt", zone]).get("data", {})
+        prompt = zp.get("prompt")
+        display = zp.get("display")
     except (OSError, ValueError):
         return  # never break session start — degrade to silent plain CC
-    if not prompt:
+    if not prompt or not display:
         return
     # Pending probe lives in `zone pending` (M-3/M-5); hook only formats the hint
     hint = format_pending_hint(probe_pending(root, zone, payload.get("cwd")))
     # Ready-line rides INSIDE additionalContext (stdout must stay pure one-line JSON)
-    ctx = f"{LABELS[zone]}已就绪。\n{prompt}" + (f"\n{hint}" if hint else "")
+    ctx = f"{display}区已就绪。\n{prompt}" + (f"\n{hint}" if hint else "")
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "SessionStart", "additionalContext": ctx,
     }}, ensure_ascii=False))

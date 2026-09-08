@@ -353,13 +353,30 @@ def zone_prompt_text(zone, repo_root=None):
     return prompt
 
 
+def zone_display_text(zone, repo_root=None):
+    """区名 -> display 显示名（07-01 文案单源：zones/*.yaml 的 display 字段）。
+
+    与 zone_prompt_text 同管线（load_zone_def 合并后取顶层字段），hook 提示行
+    的文案唯一来源；「区」后缀由 hook 拼（yaml 现值无后缀）。
+    未知区 / 解析失败 / display 缺失或为空抛 ZoneDefError（与 prompt 同校验形状）。
+    """
+    data = load_zone_def(zone, repo_root)
+    display = data.get("display")
+    if not isinstance(display, str) or not display.strip():
+        raise ZoneDefError(f"display 字段缺失或为空（{zone}）")
+    return display
+
+
 def cmd_zone_prompt(args):
     try:
         prompt = zone_prompt_text(args.zone_name)
+        display = zone_display_text(args.zone_name)
     except ZoneDefError as exc:
         return fail("_zone-prompt", str(exc), EXIT_BAD_DEF, args.json)
     if args.json:
-        return emit_ok("_zone-prompt", {"zone": args.zone_name, "prompt": prompt})
+        return emit_ok("_zone-prompt", {
+            "zone": args.zone_name, "prompt": prompt, "display": display,
+        })
     print(prompt, end="")  # prompt 本身以 \n 收尾（块标量 clip）
     return EXIT_OK
 
@@ -1738,7 +1755,8 @@ def _guard_resolve_zone(args):
 
 
 def _guard_output(args, data):
-    """决策输出：--json 走附录 A data={decision,zone,pattern?}（04-01）。"""
+    """决策输出：--json 走附录 A data={decision,zone,display,pattern?}（04-01；
+    display 由 07-01 追加——hook 护栏文案的单源，missing fallback zone 原名）。"""
     if args.json:
         return emit_ok("_check-guard", data)
     line = f"{data['decision']} {data['zone']}"
@@ -1746,6 +1764,21 @@ def _guard_output(args, data):
         line += f" {data['pattern']}"
     print(line)
     return EXIT_OK
+
+
+def _guard_display(zone):
+    """display 显示名（07-01 文案单源；unzoned 为 None）。
+
+    调用方已过 ZONES 封闭集合判断；ZoneDefError 不在吞——guard 链路对
+    定义不可用必须放行（GUARD-03），返回 None 时 hook 侧 fallback zone 原名
+    （degrade-to-open 精神：文案缺失不产生新的失败路径）。
+    """
+    if zone not in ZONES:
+        return None
+    try:
+        return zone_display_text(zone, os.getcwd())
+    except ZoneDefError:
+        return None
 
 
 def cmd_check_guard(args):
@@ -1775,20 +1808,25 @@ def _check_guard_write(args):
     path = normalize_path(args.path)
 
     if zone not in ZONES:  # 未登记 / 无会话 id → unzoned，GUARD-03 后半
-        return _guard_output(args, {"decision": "allow", "zone": "unzoned"})
+        return _guard_output(args, {"decision": "allow", "zone": "unzoned",
+                                    "display": None})
 
     try:
         guards = (load_zone_def(zone, cwd) or {}).get("guards") or {}
     except ZoneDefError as exc:
         return fail("_check-guard", f"区定义不可用（{exc}）", EXIT_BAD_DEF, args.json)
+    display = _guard_display(zone)
 
     if guards.get("deny_write_edit") is not True:
-        return _guard_output(args, {"decision": "allow", "zone": zone})
+        return _guard_output(args, {"decision": "allow", "zone": zone,
+                                    "display": display})
 
     for pattern in guards.get("allow_paths") or []:
         if isinstance(pattern, str) and match_glob(pattern, path):
-            return _guard_output(args, {"decision": "allow", "zone": zone})
-    return _guard_output(args, {"decision": "deny", "zone": zone, "pattern": path})
+            return _guard_output(args, {"decision": "allow", "zone": zone,
+                                        "display": display})
+    return _guard_output(args, {"decision": "deny", "zone": zone,
+                                "display": display, "pattern": path})
 
 
 def _check_guard_bash(args):
@@ -1796,17 +1834,20 @@ def _check_guard_bash(args):
 
     bash_block_patterns（正则 list，§8.2 L-6）逐条 re.search on command
     字符串——黑名单只拦已知危险形态，不枚举安全命令；空列表 → 自然 allow。
+    display（07-01）：deny/allow 一律带——文案单源，hook 只读不派生。
     """
     zone, cwd = _guard_resolve_zone(args)
     command = args.command
 
     if zone not in ZONES:  # 未登记 / 无会话 id → unzoned，GUARD-03（非 maint 不查）
-        return _guard_output(args, {"decision": "allow", "zone": "unzoned"})
+        return _guard_output(args, {"decision": "allow", "zone": "unzoned",
+                                    "display": None})
 
     try:
         guards = (load_zone_def(zone, cwd) or {}).get("guards") or {}
     except ZoneDefError as exc:
         return fail("_check-guard", f"区定义不可用（{exc}）", EXIT_BAD_DEF, args.json)
+    display = _guard_display(zone)
 
     for pattern in guards.get("bash_block_patterns") or []:
         if isinstance(pattern, str):
@@ -1816,8 +1857,10 @@ def _check_guard_bash(args):
                 continue
             if matched:
                 return _guard_output(args, {
-                    "decision": "deny", "zone": zone, "pattern": pattern})
-    return _guard_output(args, {"decision": "allow", "zone": zone})
+                    "decision": "deny", "zone": zone, "display": display,
+                    "pattern": pattern})
+    return _guard_output(args, {"decision": "allow", "zone": zone,
+                                "display": display})
 
 
 # ---------------------------------------------------------------------------
