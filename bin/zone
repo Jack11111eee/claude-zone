@@ -9,8 +9,9 @@
 01-01：公共框架 + `title`（§3 命名语法与归一化）。
 01-03：sidecar 索引引擎（§7.1/§7.2：slug 路径 / append / 重放）+ `which` + `list`
        + 内部子命令 `_register-session`（M-5：hook 薄封装的登记入口）。
-其余子命令（pending/register/snapshot/inject/gc/doctor/show）仅声明骨架，
-后续 plan 填实。
+02-01：受限 yaml 解析器（纯标准库，§8 schema 子集）+ `show`（覆盖式合并视图，
+       Q-4 深合并）+ `doctor`（内置定义校验 / P-6 第五区 / B-6 未知字段）。
+其余子命令（pending/register/snapshot/inject/gc）仅声明骨架，后续 plan 填实。
 """
 
 import argparse
@@ -468,11 +469,483 @@ def _render_handoff_table(rows):
 
 
 # ---------------------------------------------------------------------------
+# zone.yaml 定义体系（§8：受限 yaml 解析 + 覆盖式合并 Q-4 + doctor 校验）
+#
+# 纯标准库约束：插件运行环境无 PyYAML 保证，故自实现受限子集解析器。
+# 支持形态（恰覆盖 zones/*.yaml 的 schema 子集）：
+#   - flat key：标量值（bool / 裸串 / 单引号 / 双引号 / 空流列表 []）
+#   - 一层嵌套 dict（inject_on_entry / guards）
+#   - 字符串列表（- "x" / - 'x' / - x，缩进比子键深一层）
+#   - 块标量 prompt（`key: |` 后跟更深缩进正文，保留换行）
+#   - 注释行（# 开头）与空行跳过（块标量内部按 YAML 语义原样保留）
+# 遇到子集外形态（锚点 / 多文档 / tab 缩进 / 二级嵌套等）抛 ZoneDefError。
+# ---------------------------------------------------------------------------
+
+# §8 允许字段集合（B-6：schema 外字段不静默——doctor 报错、show exit 4）
+ZONE_TOP_FIELDS = ("name", "display", "prefix", "prompt", "mode_hint",
+                   "model_hint", "inject_on_entry", "guards", "handoff_out")
+GUARD_FIELDS = ("deny_write_edit", "allow_paths", "bash_block_patterns")
+INJECT_FIELDS = ("zone_prompt", "pending_handoff_scan")
+
+
+class ZoneDefError(Exception):
+    """zone.yaml 解析/校验失败（§8）；show 消费为 exit 4，doctor 消费为问题条目。"""
+
+
+def _indent_width(raw, lineno):
+    """行前导空格数；tab 缩进记非法（受限子集只允许空格）。"""
+    stripped = raw.lstrip(" ")
+    if stripped.startswith("\t"):
+        raise ZoneDefError(f"第 {lineno} 行：缩进含 tab（只允许空格）")
+    return len(raw) - len(stripped)
+
+
+_DQ_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "0": "\0"}
+
+
+def _parse_scalar(token, lineno):
+    """受限标量：bool / 空流列表 [] / 双引号 / 单引号 / 裸字符串。
+
+    双引号按 YAML 语义处理转义（\\\\ → \\，\\" → " 等；未定义转义原样保留
+    反斜杠——历史教训：双引号里的 \\s 不得畸变为 s 或 \\\\s）。单引号按
+    YAML 语义不处理转义（仅 '' → '，正则模式零畸变）。
+    """
+    if token == "[]":
+        return []
+    if token.startswith(("[", "{", "]", "}", ",")):
+        raise ZoneDefError(
+            f"第 {lineno} 行：流式集合语法不在受限子集内（仅允许空列表 []）：{token[:30]}")
+    if token in ("true", "false"):
+        return token == "true"
+    if token.startswith('"') or token.startswith("'"):
+        if len(token) < 2 or not token.endswith(token[0]):
+            raise ZoneDefError(f"第 {lineno} 行：引号未闭合：{token[:30]}")
+        if token[0] == "'":
+            return token[1:-1].replace("''", "'")
+        body = token[1:-1]
+        out = []
+        i = 0
+        while i < len(body):
+            ch = body[i]
+            if ch != "\\":
+                out.append(ch)
+                i += 1
+                continue
+            if i + 1 >= len(body):
+                raise ZoneDefError(f"第 {lineno} 行：孤立的转义反斜杠")
+            nxt = body[i + 1]
+            out.append(_DQ_ESCAPES.get(nxt, "\\" + nxt))
+            i += 2
+        return "".join(out)
+    return token
+
+
+def _parse_block_scalar(lines, i):
+    """`key: |` 正文：收集比顶层 key 更深缩进的行（含内部空行）。
+
+    返回 (value, next_i)。换行保留；首尾空行丢弃；按最小缩进 dedent。
+    """
+    block = []
+    n = len(lines)
+    while i < n:
+        raw = lines[i]
+        if not raw.strip():
+            block.append(None)  # 空行占位（块尾的被裁掉，块中保留为空行）
+            i += 1
+            continue
+        if _indent_width(raw, i + 1) == 0:
+            break
+        block.append(raw)
+        i += 1
+    while block and block[-1] is None:
+        block.pop()
+    while block and block[0] is None:
+        block.pop(0)
+    bodies = [b for b in block if b is not None]
+    if not bodies:
+        return "", i
+    base = min(len(b) - len(b.lstrip(" ")) for b in bodies)
+    joined = "\n".join("" if b is None else b[base:] for b in block)
+    # YAML `|`（clip chomping）：正文后恰保留一个换行
+    return joined + "\n", i
+
+
+def _parse_section(lines, i, head_lineno):
+    """一层嵌套 dict 正文（guards: / inject_on_entry: 之后）-> (dict, next_i)。
+
+    子值支持：标量 / 空流列表 [] / 字符串列表（- x，缩进比子键深）。
+    """
+    n = len(lines)
+    sub = {}
+    sub_indent = None
+    while i < n:
+        raw = lines[i]
+        lineno = i + 1
+        content = raw.strip()
+        if not content or content.startswith("#"):
+            i += 1
+            continue
+        indent = _indent_width(raw, lineno)
+        if indent == 0:
+            break
+        if sub_indent is None:
+            sub_indent = indent
+        elif indent != sub_indent:
+            raise ZoneDefError(
+                f"第 {lineno} 行：嵌套缩进不一致（期望 {sub_indent} 列）")
+        if content.startswith("- "):
+            raise ZoneDefError(
+                f"第 {lineno} 行：section 不支持列表项（一层 dict 之外）")
+        key, sep, rest = content.partition(":")
+        key = key.strip()
+        if not sep or not key:
+            raise ZoneDefError(f"第 {lineno} 行：无法解析（期望 key: value）：{content[:40]}")
+        rest = rest.strip()
+        i += 1
+        if rest:
+            sub[key] = _parse_scalar(rest, lineno)
+            continue
+        # 子键值为空：期待字符串列表（更深一层缩进的 - item）
+        items = []
+        item_indent = None
+        while i < n:
+            iraw = lines[i]
+            ilineno = i + 1
+            icontent = iraw.strip()
+            if not icontent or icontent.startswith("#"):
+                i += 1
+                continue
+            iindent = _indent_width(iraw, ilineno)
+            if iindent <= sub_indent:
+                break
+            if not icontent.startswith("- "):
+                raise ZoneDefError(
+                    f"第 {ilineno} 行：{key} 期待列表项（- item），得到：{icontent[:40]}")
+            if item_indent is None:
+                item_indent = iindent
+            elif iindent != item_indent:
+                raise ZoneDefError(
+                    f"第 {ilineno} 行：列表缩进不一致（期望 {item_indent} 列）")
+            items.append(_parse_scalar(icontent[2:].strip(), ilineno))
+            i += 1
+        if not items:
+            raise ZoneDefError(
+                f"第 {lineno} 行：{key} 为空值（期待 `- item` 列表或 `[]`）")
+        sub[key] = items
+    if sub_indent is None:
+        raise ZoneDefError(f"第 {head_lineno} 行：section 为空（期待一层嵌套内容）")
+    return sub, i
+
+
+def parse_zone_yaml(text):
+    """受限 yaml（§8 子集）-> dict。解析不了抛 ZoneDefError。"""
+    lines = text.splitlines()
+    n = len(lines)
+    result = {}
+    i = 0
+    while i < n:
+        raw = lines[i]
+        lineno = i + 1
+        content = raw.strip()
+        if not content or content.startswith("#"):
+            i += 1
+            continue
+        if _indent_width(raw, lineno) != 0:
+            raise ZoneDefError(f"第 {lineno} 行：顶层不允许缩进")
+        if content.startswith("- "):
+            raise ZoneDefError(f"第 {lineno} 行：顶层不支持列表项")
+        key, sep, rest = content.partition(":")
+        key = key.strip()
+        if not sep or not key:
+            raise ZoneDefError(f"第 {lineno} 行：无法解析（期望 key: value）：{content[:40]}")
+        rest = rest.strip()
+        i += 1
+        if rest == "|":
+            value, i = _parse_block_scalar(lines, i)
+            result[key] = value
+        elif rest[:1] in ("|", ">"):
+            raise ZoneDefError(f"第 {lineno} 行：块标量只支持 `|`（得到 {rest}）")
+        elif rest:
+            result[key] = _parse_scalar(rest, lineno)
+        else:
+            sub, i = _parse_section(lines, i, lineno)
+            result[key] = sub
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 载入与合并（Q-4）：内置 zones/<zone>.yaml -> repo .claude/zones/<zone>.yaml
+# ---------------------------------------------------------------------------
+
+def builtin_zones_dir():
+    """内置定义根目录：bin 文件相对 ../zones/（= 插件根/zones/，不依赖 cwd）。"""
+    try:
+        me = __file__
+    except NameError:  # exec(open(...)) 场景兜底
+        me = sys.argv[0] if sys.argv and sys.argv[0] else "zone"
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(me))), "zones")
+
+
+def _deep_merge(base, overlay):
+    """字段级深合并：dict 递归；标量与列表整体替换（Q-4）。"""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_zone_def(zone, repo_root=None):
+    """内置 -> repo 覆盖 -> 合并后 dict（Q-4 方向：repo 覆盖插件默认）。
+
+    未知区名（P-6）、解析失败、覆盖层未知字段（B-6）抛 ZoneDefError。
+    """
+    if zone not in ZONES:
+        raise ZoneDefError(f"未知区：{zone}（四区封闭集合：{'/'.join(ZONES)}，P-6）")
+    repo_root = os.getcwd() if repo_root is None else repo_root
+    builtin_path = os.path.join(builtin_zones_dir(), f"{zone}.yaml")
+    try:
+        with open(builtin_path, encoding="utf-8") as fh:
+            base = parse_zone_yaml(fh.read())
+    except OSError as exc:
+        raise ZoneDefError(f"内置定义不可读：{builtin_path}（{exc}）")
+    overlay_path = os.path.join(repo_root, ".claude", "zones", f"{zone}.yaml")
+    if not os.path.exists(overlay_path):
+        return base
+    try:
+        with open(overlay_path, encoding="utf-8") as fh:
+            overlay = parse_zone_yaml(fh.read())
+    except OSError as exc:
+        raise ZoneDefError(f"覆盖层不可读：{overlay_path}（{exc}）")
+    unknown = _unknown_field_problems(overlay, overlay_path)
+    if unknown:
+        first = unknown[0]
+        raise ZoneDefError(f"{first['file']}：{first['field']}：{first['message']}")
+    return _deep_merge(base, overlay)
+
+
+def _unknown_field_problems(data, rel):
+    """B-6 未知字段检查（不静默）。允许字段集合见 ZONE_TOP_FIELDS 等常量。"""
+    problems = []
+    for key in data:
+        if key not in ZONE_TOP_FIELDS:
+            problems.append({"file": rel, "field": key,
+                             "message": f"未知字段（允许：{'/'.join(ZONE_TOP_FIELDS)}）"})
+    if isinstance(data.get("guards"), dict):
+        for key in data["guards"]:
+            if key not in GUARD_FIELDS:
+                problems.append({"file": rel, "field": f"guards.{key}",
+                                 "message": f"未知字段（guards 允许：{'/'.join(GUARD_FIELDS)}）"})
+    if isinstance(data.get("inject_on_entry"), dict):
+        for key in data["inject_on_entry"]:
+            if key not in INJECT_FIELDS:
+                problems.append({"file": rel, "field": f"inject_on_entry.{key}",
+                                 "message": f"未知字段（inject_on_entry 允许：{'/'.join(INJECT_FIELDS)}）"})
+    return problems
+
+
+def _value_problems(data, rel):
+    """(a) 内置定义字段校验：未知字段 + 类型/值域（前缀一致、guards 值域合法）。"""
+    problems = []
+    name = data.get("name")
+    prefix = data.get("prefix")
+    if not isinstance(name, str) or not name:
+        problems.append({"file": rel, "field": "name",
+                         "message": f"name 缺失或非字符串（得到 {type(name).__name__}）"})
+    elif not isinstance(prefix, str) or not prefix.startswith("--"):
+        problems.append({"file": rel, "field": "prefix",
+                         "message": f"prefix 必须形如 --<name>（得到 {prefix!r}）"})
+    elif prefix != f"--{name}":
+        problems.append({"file": rel, "field": "prefix",
+                         "message": f"prefix 与 name 不一致：应为 --{name}（得到 {prefix}）"})
+    guards = data.get("guards")
+    if guards is not None:
+        if not isinstance(guards, dict):
+            problems.append({"file": rel, "field": "guards",
+                             "message": "guards 必须是映射（一层嵌套）"})
+        else:
+            dw = guards.get("deny_write_edit")
+            if not isinstance(dw, bool):
+                problems.append({"file": rel, "field": "guards.deny_write_edit",
+                                 "message": f"deny_write_edit 必须是 bool（得到 {type(dw).__name__}）"})
+            for sub_key in ("allow_paths", "bash_block_patterns"):
+                value = guards.get(sub_key)
+                if not isinstance(value, list) or any(
+                        not isinstance(x, str) for x in value):
+                    problems.append({"file": rel, "field": f"guards.{sub_key}",
+                                     "message": f"{sub_key} 必须是字符串列表"})
+            patterns = guards.get("bash_block_patterns")
+            if isinstance(patterns, list):
+                for idx, pat in enumerate(patterns):
+                    if not isinstance(pat, str):
+                        continue
+                    try:
+                        re.compile(pat)
+                    except re.error as exc:
+                        problems.append({
+                            "file": rel, "field": f"guards.bash_block_patterns[{idx}]",
+                            "message": f"正则不可编译：{pat!r}（{exc}）"})
+    inject = data.get("inject_on_entry")
+    if inject is not None:
+        if not isinstance(inject, dict):
+            problems.append({"file": rel, "field": "inject_on_entry",
+                             "message": "inject_on_entry 必须是映射（一层嵌套）"})
+        else:
+            for sub_key in ("zone_prompt", "pending_handoff_scan"):
+                value = inject.get(sub_key)
+                if not isinstance(value, bool):
+                    problems.append({
+                        "file": rel, "field": f"inject_on_entry.{sub_key}",
+                        "message": f"必须为 bool（得到 {type(value).__name__}）"})
+    problems.extend(_unknown_field_problems(data, rel))
+    return problems
+
+
+def _load_yaml_for_doctor(path, rel, problems):
+    """读 + 解析单个 yaml；出错落 problem 条目并返回 None。"""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        problems.append({"file": rel, "field": "", "message": f"文件不可读：{exc}"})
+        return None
+    try:
+        return parse_zone_yaml(text)
+    except ZoneDefError as exc:
+        problems.append({"file": rel, "field": "", "message": f"解析失败：{exc}"})
+        return None
+
+
+def doctor_problems(repo_root=None):
+    """doctor 数据采集（附录 A data={problems:[{file,field,message}]}）。
+
+    (a) 四内置定义逐一解析+字段校验；(b) repo 覆盖层第五区名 → P-6 警告；
+    (c) 覆盖层未知字段 → B-6 错误条目。孤儿/幽灵/索引一致性属 03-03，不做。
+    """
+    repo_root = os.getcwd() if repo_root is None else repo_root
+    problems = []
+    builtins = {}
+    for zone in ZONES:
+        rel = f"zones/{zone}.yaml"
+        data = _load_yaml_for_doctor(
+            os.path.join(builtin_zones_dir(), f"{zone}.yaml"), rel, problems)
+        if data is None:
+            continue
+        problems.extend(_value_problems(data, rel))
+        builtins[zone] = data
+    overlay_dir = os.path.join(repo_root, ".claude", "zones")
+    if not os.path.isdir(overlay_dir):
+        return problems
+    for entry in sorted(os.listdir(overlay_dir)):
+        if not entry.endswith(".yaml"):
+            continue
+        rel = f".claude/zones/{entry}"
+        path = os.path.join(overlay_dir, entry)
+        if entry[:-len(".yaml")] not in ZONES:
+            problems.append({
+                "file": rel, "field": "",
+                "message": "第五区名：不在四区封闭集合（P-6），此文件不生效；"
+                           f"允许：{'/'.join(ZONES)}。请删除或迁移"})
+            continue
+        data = _load_yaml_for_doctor(path, rel, problems)
+        if data is None:
+            continue
+        # 覆盖层可只写部分字段（Q-4 深合并）——值域校验作用于合并后定义
+        #（即 show 输出、hook 读入的最终形态），部分覆盖不产生虚假缺失项。
+        merged = _deep_merge(builtins.get(entry[:-len(".yaml")], {}), data)
+        problems.extend(_value_problems(merged, rel))
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# show：合并视图渲染（重渲染为受限 yaml 文本，人读友好）
+# ---------------------------------------------------------------------------
+
+_ZONE_FIELD_ORDER = ("name", "display", "prefix", "prompt", "mode_hint",
+                     "model_hint", "inject_on_entry", "guards", "handoff_out")
+_YAML_PLAIN_FORBIDDEN_HEAD = "!&*-:?|>%@`'\"#,[]{}"
+
+
+def _yaml_scalar(value):
+    """渲染为 yaml 标量：bool 原样；字符串按需双引号（转义安全）。"""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    s = str(value)
+    if (s == "" or s[0] in _YAML_PLAIN_FORBIDDEN_HEAD or s != s.strip()
+            or ":" in s or "#" in s or "\n" in s):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s
+
+
+def render_zone_yaml(data):
+    """合并后定义 -> yaml 文本（受限 schema 重渲染；值级与源一致）。"""
+    out = []
+    for key in _ZONE_FIELD_ORDER:
+        if key not in data:
+            continue
+        value = data[key]
+        if key == "prompt" and isinstance(value, str):
+            out.append("prompt: |")
+            body = value[:-1] if value.endswith("\n") else value
+            for line in (body.split("\n") if body else []):
+                out.append("  " + line if line else "")
+            continue
+        if isinstance(value, dict):
+            out.append(f"{key}:")
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, list):
+                    if not sub_value:
+                        out.append(f"  {sub_key}: []")
+                    else:
+                        out.append(f"  {sub_key}:")
+                        # 单引号风格：正则模式零转义畸变，人读友好
+                        for item in sub_value:
+                            out.append(f"    - '{str(item).replace(chr(39), chr(39)*2)}'")
+                else:
+                    out.append(f"  {sub_key}: {_yaml_scalar(sub_value)}")
+            continue
+        out.append(f"{key}: {_yaml_scalar(value)}")
+    for key, value in data.items():  # 兜底（load 已挡未知字段）
+        if key in _ZONE_FIELD_ORDER:
+            continue
+        out.append(f"{key}: {_yaml_scalar(value)}")
+    return "\n".join(out) + "\n"
+
+
+def cmd_show(args):
+    try:
+        data = load_zone_def(args.zone_name)
+    except ZoneDefError as exc:
+        return fail("show", str(exc), EXIT_BAD_DEF, args.json)
+    text = render_zone_yaml(data)
+    if args.json:
+        return emit_ok("show", {"zone_yaml": text})
+    print(text, end="")
+    return EXIT_OK
+
+
+def cmd_doctor(args):
+    problems = doctor_problems()
+    if args.json:
+        return emit_ok("doctor", {"problems": problems})
+    if not problems:
+        print("OK")
+        return EXIT_OK
+    print(f"发现 {len(problems)} 个问题：")
+    for p in problems:
+        field = f" [{p['field']}]" if p.get("field") else ""
+        print(f"  {p['file']}{field} {p['message']}")
+    return EXIT_OK  # 附录 A：doctor 始终 exit 0，问题见输出/data
+
+
+# ---------------------------------------------------------------------------
 # 未实现子命令（本 plan 只声明，exit 2）
 # ---------------------------------------------------------------------------
 
 NOT_IMPLEMENTED = ("pending", "register", "snapshot",
-                   "inject", "gc", "doctor", "show")
+                   "inject", "gc")
 
 
 def make_stub(cmd_name):
@@ -546,13 +1019,13 @@ def build_parser():
                    help="stale 阈值天数（缺省 14）")
     p.set_defaults(func=make_stub("gc"))
 
-    p = add("doctor", "校验 zone 定义与索引一致性")
-    p.set_defaults(func=make_stub("doctor"))
+    p = add("doctor", "校验 zone 定义与覆盖层合法性")
+    p.set_defaults(func=cmd_doctor)
 
     p = add("show", "某区定义的最终合并视图")
     p.add_argument("zone_name", metavar="zone",
                    help="区名（chore/core/discuss/maint）")
-    p.set_defaults(func=make_stub("show"))
+    p.set_defaults(func=cmd_show)
 
     p = add("title", "归一化 + 前缀判定")
     p.add_argument("title", help="会话标题字符串")
