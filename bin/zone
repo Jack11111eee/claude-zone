@@ -6,14 +6,20 @@
   失败: {"ok": false, "v": 1, "cmd": "<cmd>", "error": "...", "exit": N}
 退出码：0 成功；2 用法错误；3 找不到匹配的 handoff；4 定义非法。
 
-本文件在 01-01 实现：公共框架 + `title`（§3 命名语法与归一化）。
-其余子命令（which/list/pending/register/snapshot/inject/gc/doctor/show）
-仅声明骨架，后续 plan 填实。
+01-01：公共框架 + `title`（§3 命名语法与归一化）。
+01-03：sidecar 索引引擎（§7.1/§7.2：slug 路径 / append / 重放）+ `which` + `list`
+       + 内部子命令 `_register-session`（M-5：hook 薄封装的登记入口）。
+其余子命令（pending/register/snapshot/inject/gc/doctor/show）仅声明骨架，
+后续 plan 填实。
 """
 
 import argparse
 import json
+import os
+import re
 import sys
+import unicodedata
+from datetime import datetime
 
 # 四区封闭集合（DESIGN.md §2，P-6：不可增删分区）
 ZONES = ("chore", "core", "discuss", "maint")
@@ -106,10 +112,366 @@ def cmd_title(args):
 
 
 # ---------------------------------------------------------------------------
+# sidecar 索引引擎（DESIGN.md §7.1 布局 / §7.2 事件 schema）
+#
+#   ~/.claude/zoning/<project-slug>/index.jsonl   append-only 事件流
+#   ~/.claude/zoning/<project-slug>/handoffs/<zone>/   ×4
+#   ~/.claude/zoning/<project-slug>/handoffs/.trash/
+#
+# slug 规则同 ~/.claude/projects：cwd 绝对路径中非 [A-Za-z0-9] 字符逐个替换为 -。
+# 环境变量 ZONING_HOME 可覆盖 ~/.claude（测试用，不进文档契约）。
+# ---------------------------------------------------------------------------
+
+def project_slug(cwd):
+    """cwd 绝对路径 -> project slug（非 [A-Za-z0-9] 逐字符替换为 -，§7.1）。"""
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(cwd))
+
+
+def zoning_dir(cwd):
+    """cwd -> 该项目的 sidecar 数据目录（ZONING_HOME 覆盖 ~/.claude）。"""
+    home = os.environ.get("ZONING_HOME")
+    base = home if home else os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "zoning", project_slug(cwd))
+
+
+def index_path(cwd):
+    return os.path.join(zoning_dir(cwd), "index.jsonl")
+
+
+def ensure_layout(cwd):
+    """确保目录骨架存在（index.jsonl 与 handoffs/<zone>/×4 与 .trash/，§7.1）。"""
+    zdir = zoning_dir(cwd)
+    paths = [zdir, os.path.join(zdir, "index.jsonl")]
+    for zone in ZONES:
+        paths.append(os.path.join(zdir, "handoffs", zone))
+    paths.append(os.path.join(zdir, "handoffs", ".trash"))
+    for path in paths:
+        if path.endswith(".jsonl"):
+            if not os.path.exists(path):
+                with open(path, "a", encoding="utf-8"):
+                    pass
+        elif not os.path.isdir(path):
+            os.makedirs(path, exist_ok=True)
+    return zdir
+
+
+def now_iso():
+    """本地时区 ISO8601 带偏移（§7.2 ts 字段）。"""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def append_event(cwd, event):
+    """单行 JSON append（open(..., "a")；并发容忍靠单行语义，§7.2 L-2）。"""
+    ensure_layout(cwd)
+    with open(index_path(cwd), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def read_events(cwd):
+    """重放 index.jsonl：逐行 json.loads，坏行跳过收集（doctor 消费）。
+
+    返回 (events, skipped)；坏行序号从 1 起。
+    """
+    path = index_path(cwd)
+    events, skipped = [], []
+    if not os.path.exists(path):
+        return events, skipped
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                skipped.append(lineno)
+                continue
+            if isinstance(obj, dict):
+                events.append(obj)
+            else:
+                skipped.append(lineno)
+    return events, skipped
+
+
+def replay_sessions(events):
+    """事件流 -> {sessionId: 最后一条 session 事件}（同 key 后事件即现值）。"""
+    current = {}
+    for ev in events:
+        if ev.get("type") == "session":
+            sid = ev.get("sessionId")
+            if sid:
+                current[sid] = ev
+    return current
+
+
+def relative_time(ts, now=None):
+    """ISO8601 ts -> 中文相对时间（list 表格渲染用）。"""
+    now = now or datetime.now().astimezone()
+    try:
+        then = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return "—"
+    delta = (now - then).total_seconds()
+    if delta < 0:
+        delta = 0
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return f"{int(delta // 60)}分钟前"
+    if delta < 86400:
+        return f"{int(delta // 3600)}小时前"
+    return f"{int(delta // 86400)}天前"
+
+
+def truncate(text, width=24):
+    """标题截断（表格列宽内；按显示宽度，中文计 2 列）。"""
+    if text is None:
+        return ""
+    text = str(text)
+    if display_width(text) <= width:
+        return text
+    out, w = "", 0
+    for ch in text:
+        cw = _char_width(ch)
+        if w + cw > width - 1:
+            break
+        out += ch
+        w += cw
+    return out + "…"
+
+
+def _char_width(ch):
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def display_width(text):
+    return sum(_char_width(ch) for ch in str(text))
+
+
+def _table_row(cells):
+    """[(text, width), ...] -> 按显示宽度对齐后的表格行（中文计 2 列）。"""
+    parts = []
+    for text, width in cells:
+        pad = width - display_width(text)
+        parts.append(str(text) + " " * max(pad, 1))
+    return "".join(parts).rstrip()
+
+
+# ---------------------------------------------------------------------------
+# _register-session（内部子命令，M-5：SessionStart hook 的薄封装登记入口）
+# ---------------------------------------------------------------------------
+
+def cmd_register_session(args):
+    """stdin JSON -> session 事件 append（unzoned 零动作 exit 0）。
+
+    stdin 字段（Claude Code hook 实际字段名）：session_id / session_title /
+    cwd / source。索引事件 schema 用 §7.2 拼写（sessionId），此处映射。
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return fail("_register-session", "stdin 不是合法 JSON", EXIT_USAGE, args.json)
+
+    session_id = payload.get("session_id") or ""
+    session_title = payload.get("session_title") or ""
+    cwd = payload.get("cwd") or os.getcwd()
+
+    zone, rest, normalized = parse_title(session_title)
+    if zone is None:
+        # unzoned：静默纯 CC（§3），零动作
+        if args.json:
+            return emit_ok("_register-session", {"zone": "unzoned", "appended": False})
+        return EXIT_OK
+
+    # 归一化后的完整标题写进事件（残留 [zone] 旧语法即修正为 --zone）
+    title = f"--{zone} {rest}" if rest else f"--{zone}"
+
+    event = {
+        "v": 1,
+        "ts": now_iso(),
+        "type": "session",
+        "sessionId": session_id,
+        "zone": zone,
+        "title": title,
+        "cwd": cwd,
+        "source": payload.get("source") or "prefix",
+    }
+    append_event(cwd, event)
+
+    if args.json:
+        return emit_ok("_register-session", {
+            "zone": zone, "title": title, "sessionId": session_id, "appended": True,
+        })
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# which：会话归属查询（§7.3）
+# ---------------------------------------------------------------------------
+
+def cmd_which(args):
+    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not session_id:
+        return fail(
+            "which",
+            "缺少会话 id：--session <id> 或环境变量 CLAUDE_CODE_SESSION_ID",
+            EXIT_USAGE,
+            args.json,
+        )
+
+    cwd = args.cwd or os.getcwd()
+    events, _ = read_events(cwd)
+    current = replay_sessions(events)
+    ev = current.get(session_id)
+
+    if ev is None:
+        if args.json:
+            return emit_ok("which", {"zone": "unzoned", "title": None, "source": None})
+        print("unzoned")
+        return EXIT_OK
+
+    zone = ev.get("zone") or "unzoned"
+    if args.json:
+        return emit_ok("which", {
+            "zone": zone,
+            "title": ev.get("title"),
+            "source": ev.get("source"),
+        })
+    print(zone)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# list：会话与 handoff 索引摘要（§5 契约表）
+# ---------------------------------------------------------------------------
+
+def cmd_list(args):
+    if args.zone is not None and args.zone not in ZONES:
+        return fail("list", f"未知区：{args.zone}（四区封闭集合：{'/'.join(ZONES)}）",
+                    EXIT_BAD_DEF, args.json)
+
+    cwd = os.getcwd()
+    events, _ = read_events(cwd)
+    sessions = replay_sessions(events)
+
+    rows = []
+    for sid, ev in sessions.items():
+        zone = ev.get("zone") or "unzoned"
+        if args.zone and zone != args.zone:
+            continue
+        rows.append({
+            "sessionId": sid,
+            "zone": zone,
+            "title": ev.get("title") or "",
+            "ts": ev.get("ts"),
+        })
+    # 最新登记在前（ts 倒序；无 ts 的兜底排尾）
+    rows.sort(key=lambda r: r["ts"] or "", reverse=True)
+
+    # M0：handoffs 尚无 register/inject，索引中不会有 handoff 状态 —— 表格层
+    # 渲染 handoff 表段（空表头 + 空集）；索引中万一出现 handoff 事件也不翻车。
+    handoff_states = _replay_handoffs(events)
+    handoff_rows = []
+    for hid, ev in handoff_states.items():
+        if args.zone and ev.get("to") != args.zone:
+            continue
+        handoff_rows.append({
+            "id": hid,
+            "from": ev.get("from"),
+            "to": ev.get("to"),
+            "status": ev.get("status"),
+            "title": ev.get("title") or "",
+            "created": ev.get("created") or ev.get("ts"),
+        })
+
+    if args.json:
+        items = []
+        for r in rows:
+            items.append({
+                "id": r["sessionId"],
+                "zone": r["zone"],
+                "title": r["title"],
+                "ts": r["ts"],
+            })
+        for h in handoff_rows:
+            items.append({
+                "id": h["id"],
+                "from": h["from"],
+                "to": h["to"],
+                "status": h["status"],
+                "title": h["title"],
+                "created": h["created"],
+            })
+        return emit_ok("list", {"items": items})
+
+    _render_session_table(rows)
+    _render_handoff_table(handoff_rows)
+    return EXIT_OK
+
+
+def _replay_handoffs(events):
+    """索引流 -> {handoff id: 合并状态}。
+
+    生命周期的"现值"取同 id 最后一条事件（§7.2 后事件覆盖语义）；但
+    from/to/title 只在首个登记事件出现，状态迁移事件（consumed 等）不带
+    ——故按事件顺序做字段级合并，后事件仅覆盖它携带的字段（如 status/by）。
+    """
+    current = {}
+    for ev in events:
+        if ev.get("type") != "handoff":
+            continue
+        hid = ev.get("id")
+        if not hid:
+            continue
+        merged = current.get(hid, {})
+        for key, value in ev.items():
+            if value is not None:
+                merged[key] = value
+        current[hid] = merged
+    return current
+
+
+def _render_session_table(rows):
+    """会话表（§5 list 契约在 M0 的会话段：id(zone)/标题/相对时间）。"""
+    cols = [("区", 8), ("标题", 30), ("相对时间", 12)]
+    print(_table_row(cols))
+    print("-" * 56)
+    for r in rows:
+        zone = r["zone"] or "unzoned"
+        cells = [
+            (zone, cols[0][1]),
+            (truncate(r["title"], cols[1][1]), cols[1][1]),
+            (relative_time(r["ts"]), cols[2][1]),
+        ]
+        print(_table_row(cells))
+
+
+def _render_handoff_table(rows):
+    """handoff 表（§5 列：id、状态、标题、from→to、相对时间）。"""
+    cols = [("ID", 18), ("状态", 10), ("标题", 30), ("FROM→TO", 15), ("相对时间", 12)]
+    print()
+    print(_table_row(cols))
+    print("-" * 56)
+    if not rows:
+        print("（暂无 handoff 记录）")
+        return
+    for r in rows:
+        route = f"{r['from'] or '-'}→{r['to'] or '-'}"
+        cells = [
+            (str(r["id"] or ""), cols[0][1]),
+            (str(r["status"] or "-"), cols[1][1]),
+            (truncate(r["title"], cols[2][1]), cols[2][1]),
+            (route, cols[3][1]),
+            (relative_time(r["created"]), cols[4][1]),
+        ]
+        print(_table_row(cells))
+
+
+# ---------------------------------------------------------------------------
 # 未实现子命令（本 plan 只声明，exit 2）
 # ---------------------------------------------------------------------------
 
-NOT_IMPLEMENTED = ("which", "list", "pending", "register", "snapshot",
+NOT_IMPLEMENTED = ("pending", "register", "snapshot",
                    "inject", "gc", "doctor", "show")
 
 
@@ -148,14 +510,19 @@ def build_parser():
     def add(name, help):
         return sub.add_parser(name, help=help, parents=[json_flag])
 
+    # 内部子命令（M-5：hook 薄封装调用；help 低调，不占正常命令列表的注意力）
+    p = sub.add_parser("_register-session", parents=[json_flag],
+                       help="（内部命令，hook 使用）")
+    p.set_defaults(func=cmd_register_session)
+
     p = add("which", "查会话所属区（人类诊断命令）")
     p.add_argument("--session", help="会话 id（缺省取 CLAUDE_CODE_SESSION_ID）")
     p.add_argument("--cwd", help="项目目录")
-    p.set_defaults(func=make_stub("which"))
+    p.set_defaults(func=cmd_which)
 
     p = add("list", "列 handoff 与会话索引摘要")
     p.add_argument("--zone", dest="zone", help="限定区（chore/core/discuss/maint）")
-    p.set_defaults(func=make_stub("list"))
+    p.set_defaults(func=cmd_list)
 
     p = add("pending", "仅未消费 handoff（目录扫描 ∩ 索引状态）")
     p.add_argument("--zone", dest="zone", help="限定区（chore/core/discuss/maint）")
