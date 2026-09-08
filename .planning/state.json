@@ -1,0 +1,43 @@
+{
+  "contract": "1.0.0",
+  "flavor": "core",
+  "milestone": "v1.0",
+  "phases": [
+    {
+      "number": "1",
+      "name": "M0 底座",
+      "status": "pending"
+    },
+    {
+      "number": "2",
+      "name": "M1 注入",
+      "status": "pending"
+    },
+    {
+      "number": "3",
+      "name": "M2 旗舰 handoff",
+      "status": "pending"
+    },
+    {
+      "number": "4",
+      "name": "M3 护栏",
+      "status": "pending"
+    },
+    {
+      "number": "5",
+      "name": "M4 其余链路",
+      "status": "pending"
+    },
+    {
+      "number": "6",
+      "name": "M5 巡视与糖",
+      "status": "pending"
+    }
+  ],
+  "next": {
+    "command": "/gsd:progress --next",
+    "label": "Advance to the next step",
+    "reason": "Phase 1 of 6 · executing"
+  },
+  "updated_at": "2026-09-08T00:52:55.200Z"
+}

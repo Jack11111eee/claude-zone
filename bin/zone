@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""zone — zoning 插件唯一可执行（纯 Python 标准库，单文件）。
+
+契约（DESIGN.md §5 / §13 附录 A）：
+  成功: {"ok": true,  "v": 1, "cmd": "<cmd>", "data": {...}}
+  失败: {"ok": false, "v": 1, "cmd": "<cmd>", "error": "...", "exit": N}
+退出码：0 成功；2 用法错误；3 找不到匹配的 handoff；4 定义非法。
+
+本文件在 01-01 实现：公共框架 + `title`（§3 命名语法与归一化）。
+其余子命令（which/list/pending/register/snapshot/inject/gc/doctor/show）
+仅声明骨架，后续 plan 填实。
+"""
+
+import argparse
+import json
+import sys
+
+# 四区封闭集合（DESIGN.md §2，P-6：不可增删分区）
+ZONES = ("chore", "core", "discuss", "maint")
+
+# 退出码（DESIGN.md §5）
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_NOT_FOUND = 3
+EXIT_BAD_DEF = 4
+
+VERSION = "0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# 输出契约（附录 A）
+# ---------------------------------------------------------------------------
+
+def emit_ok(cmd, data):
+    print(json.dumps(
+        {"ok": True, "v": 1, "cmd": cmd, "data": data},
+        ensure_ascii=False,
+    ))
+    return EXIT_OK
+
+
+def emit_error(cmd, error, exit_code):
+    print(json.dumps(
+        {"ok": False, "v": 1, "cmd": cmd, "error": error, "exit": exit_code},
+        ensure_ascii=False,
+    ))
+    return exit_code
+
+
+def fail(cmd, error, exit_code, as_json):
+    """失败输出：--json 走附录 A 契约，否则 stderr 人类可读。"""
+    if as_json:
+        # 契约输出始终走 stdout（机器消费）
+        return emit_error(cmd, error, exit_code)
+    print(f"zone: {error}", file=sys.stderr)
+    return exit_code
+
+
+# ---------------------------------------------------------------------------
+# title：前缀判定 + [zone] 旧语法归一化（DESIGN.md §3）
+# ---------------------------------------------------------------------------
+
+def parse_title(title):
+    """title 字符串 -> (zone, rest, normalized)。
+
+    - (a) 标题以 `--<zone> ` 开头且 zone 恰为四区之一 -> 该区。
+    - (b) 残留 `[zone] ` 旧语法（zone 恰为四区之一）-> 归一化为新前缀。
+    - (c) 其余 -> unzoned（zone=None，输出层呈现为 "unzoned"）。
+    """
+    zone, rest, normalized = None, title, False
+
+    # (a) `--<zone> ` 前缀，zone 名必须恰为四区之一（双重判据，误判面小）
+    for z in ZONES:
+        prefix = f"--{z} "
+        if title.startswith(prefix):
+            zone = z
+            rest = title[len(prefix):]
+            break
+
+    # (b) 残留 `[zone] ` 旧语法 -> 归一化（[] 是 shell glob 字符类，硬伤）
+    if zone is None:
+        for z in ZONES:
+            legacy = f"[{z}] "
+            if title.startswith(legacy):
+                zone = z
+                rest = title[len(legacy):]
+                normalized = True
+                break
+
+    return zone, rest, normalized
+
+
+def cmd_title(args):
+    zone, rest, normalized = parse_title(args.title)
+    if zone is None:
+        if args.json:
+            return emit_ok("title", {"zone": "unzoned", "rest": rest, "normalized": normalized})
+        print("unzoned")
+        return EXIT_OK
+    if args.json:
+        return emit_ok("title", {"zone": zone, "rest": rest, "normalized": normalized})
+    print(f"zone: {zone}, rest: {rest}")
+    if normalized:
+        print(f"normalized: --{zone} 前缀（原 [zone] 旧语法）")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# 未实现子命令（本 plan 只声明，exit 2）
+# ---------------------------------------------------------------------------
+
+NOT_IMPLEMENTED = ("which", "list", "pending", "register", "snapshot",
+                   "inject", "gc", "doctor", "show")
+
+
+def make_stub(cmd_name):
+    def stub(args):
+        return fail(
+            cmd_name,
+            f"not implemented: `{cmd_name}` 在本 phase 仅声明（01-02/01-03 填实）",
+            EXIT_USAGE,
+            getattr(args, "json", False),
+        )
+    return stub
+
+
+# ---------------------------------------------------------------------------
+# argparse 骨架
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    # --json：附录 A 要求所有子命令支持；全局位置与子命令后位置均接受
+    # （parents 共享旗标，避免逐个重复声明）
+    json_flag = argparse.ArgumentParser(add_help=False)
+    json_flag.add_argument(
+        "--json", action="store_true",
+        help="按附录 A 契约输出单行 JSON",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="zone",
+        description="zoning 插件命令行（chore/core/discuss/maint 四区）",
+        parents=[json_flag],
+    )
+    parser.add_argument("--version", action="version", version=f"zone {VERSION}")
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+
+    def add(name, help):
+        return sub.add_parser(name, help=help, parents=[json_flag])
+
+    p = add("which", "查会话所属区（人类诊断命令）")
+    p.add_argument("--session", help="会话 id（缺省取 CLAUDE_CODE_SESSION_ID）")
+    p.add_argument("--cwd", help="项目目录")
+    p.set_defaults(func=make_stub("which"))
+
+    p = add("list", "列 handoff 与会话索引摘要")
+    p.add_argument("--zone", dest="zone", help="限定区（chore/core/discuss/maint）")
+    p.set_defaults(func=make_stub("list"))
+
+    p = add("pending", "仅未消费 handoff（目录扫描 ∩ 索引状态）")
+    p.add_argument("--zone", dest="zone", help="限定区（chore/core/discuss/maint）")
+    p.set_defaults(func=make_stub("pending"))
+
+    p = add("register", "校验 frontmatter 合法并登记索引")
+    p.add_argument("file", help="handoff 文档路径")
+    p.set_defaults(func=make_stub("register"))
+
+    p = add("snapshot", "生成 core→maint 收尾链的现场块（纯机器产物）")
+    p.set_defaults(func=make_stub("snapshot"))
+
+    p = add("inject", "打印 handoff 全文并标记 consumed")
+    p.add_argument("id", help="handoff id（如 ho-20260907-a1b2）")
+    p.add_argument("--force", action="store_true",
+                   help="已 consumed 文档的逃生门（追加 re_consumed 事件）")
+    p.set_defaults(func=make_stub("inject"))
+
+    p = add("gc", "stale 文档移入 handoffs/.trash/")
+    p.add_argument("--stale-days", type=int, default=14, metavar="N",
+                   help="stale 阈值天数（缺省 14）")
+    p.set_defaults(func=make_stub("gc"))
+
+    p = add("doctor", "校验 zone 定义与索引一致性")
+    p.set_defaults(func=make_stub("doctor"))
+
+    p = add("show", "某区定义的最终合并视图")
+    p.add_argument("zone_name", metavar="zone",
+                   help="区名（chore/core/discuss/maint）")
+    p.set_defaults(func=make_stub("show"))
+
+    p = add("title", "归一化 + 前缀判定")
+    p.add_argument("title", help="会话标题字符串")
+    p.set_defaults(func=cmd_title)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    if getattr(args, "func", None) is None:
+        parser.print_help(sys.stderr)
+        return EXIT_USAGE
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
