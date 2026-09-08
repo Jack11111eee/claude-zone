@@ -1,2 +1,3 @@
 .DS_Store
 .sandbox-test/
+bin/__pycache__/
