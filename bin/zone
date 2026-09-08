@@ -16,7 +16,10 @@
 03-01：handoff 生命周期引擎（§6.2 frontmatter 受限解析 + register 校验登记
        M-1 写入=登记原子、无移动语义 + inject 消费 R-5 --force→re_consumed、
        幽灵 exit 3、B-1 跨区允许）。
-其余子命令（pending/snapshot/gc）仅声明骨架，后续 plan 填实。
+03-02：pending 双源查询（§7.4：目录扫描 ∩ 索引状态）+ list 的 handoff
+       全量视图（目录行状态回填、孤儿 (unregistered)、幽灵如实列、stale
+       按 §6.4 B-3 渲染时派生——created 起算 14 天，不写事件）。
+其余子命令（snapshot/gc）仅声明骨架，后续 plan 填实。
 """
 
 import argparse
@@ -25,7 +28,7 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 四区封闭集合（DESIGN.md §2，P-6：不可增删分区）
 ZONES = ("chore", "core", "discuss", "maint")
@@ -508,21 +511,10 @@ def cmd_list(args):
     # 最新登记在前（ts 倒序；无 ts 的兜底排尾）
     rows.sort(key=lambda r: r["ts"] or "", reverse=True)
 
-    # M0：handoffs 尚无 register/inject，索引中不会有 handoff 状态 —— 表格层
-    # 渲染 handoff 表段（空表头 + 空集）；索引中万一出现 handoff 事件也不翻车。
-    handoff_states = _replay_handoffs(events)
-    handoff_rows = []
-    for hid, ev in handoff_states.items():
-        if args.zone and ev.get("to") != args.zone:
-            continue
-        handoff_rows.append({
-            "id": hid,
-            "from": ev.get("from"),
-            "to": ev.get("to"),
-            "status": ev.get("status"),
-            "title": ev.get("title") or "",
-            "created": ev.get("created") or ev.get("ts"),
-        })
+    # handoff 全量视图（03-02）：目录扫描行（含 consumed/re_consumed，状态
+    # 列按索引回填、孤儿 (unregistered)）∪ 幽灵行（索引有登记但文件不在——
+    # pending 不收，list 如实报告索引现值，标 (ghost)）
+    handoff_rows = _list_handoff_rows(events, args.zone)
 
     if args.json:
         items = []
@@ -541,12 +533,64 @@ def cmd_list(args):
                 "status": h["status"],
                 "title": h["title"],
                 "created": h["created"],
+                "stale": h["stale"],
+                "unregistered": h["unregistered"],
             })
         return emit_ok("list", {"items": items})
 
     _render_session_table(rows)
     _render_handoff_table(handoff_rows)
     return EXIT_OK
+
+
+def _list_handoff_rows(events, zone=None):
+    """list 的 handoff 全量行（§5「list 列 handoff 与会话索引摘要」）。
+
+    与 pending 的差别：consumed/re_consumed 不排除（全生命周期）+ 幽灵行
+    （索引有登记无文件）如实列出（pending 静默略过，§7.4 幽灵=doctor 范围；
+    list 是巡视总览，报告比隐藏好）。目录行重用 _scan_handoff_files（时序）
+    与 _replay_handoffs（状态回填）；幽灵行的 from/to/title/created 取索引
+    合并现值（registered 事件携带，§7.2）。
+    """
+    cwd = os.getcwd()
+    states = _replay_handoffs(events)
+    now = datetime.now().astimezone()
+
+    rows = []
+    for row in _scan_handoff_files(cwd, zone):
+        hid = row["id"]
+        state = states.get(hid, {})
+        rows.append({
+            "id": hid,
+            "from": row["from"] if row["from"] is not None else state.get("from"),
+            "to": row["to"] if row["to"] is not None else state.get("to"),
+            "status": state.get("status") or "pending",
+            "title": row["title"] if row["title"] != hid else state.get("title", row["title"]),
+            "created": row["created"] or state.get("ts"),
+            "stale": _is_stale(row["created"], now),
+            "unregistered": hid not in states,
+        })
+
+    ids_on_disk = {r["id"] for r in rows}
+    for hid, state in states.items():
+        if hid in ids_on_disk:
+            continue  # 幽灵：索引登记但目录无文件（§7.4；inject 遇它 exit 3）
+        to = state.get("to")
+        if zone and to != zone:
+            continue
+        status = state.get("status") or "pending"
+        rows.append({
+            "id": hid,
+            "from": state.get("from"),
+            "to": to,
+            "status": status,
+            "title": state.get("title") or "",
+            "created": state.get("ts"),  # 幽灵无文件：created 取登记事件 ts
+            "stale": False,
+            "unregistered": False,
+            "ghost": True,  # pending 不收（doctor），list 如实报告
+        })
+    return rows
 
 
 def _replay_handoffs(events):
@@ -586,23 +630,34 @@ def _render_session_table(rows):
         print(_table_row(cells))
 
 
-def _render_handoff_table(rows):
-    """handoff 表（§5 列：id、状态、标题、from→to、相对时间）。"""
-    cols = [("ID", 18), ("状态", 10), ("标题", 30), ("FROM→TO", 15), ("相对时间", 12)]
-    print()
+def _render_handoff_table(rows, empty_text="（暂无 handoff 记录）", leading_blank=True):
+    """handoff 表（§5 列：ID、状态、标题、FROM→TO、相对时间）。
+
+    pending 与 list 共用：pending 传未消费子集，list 传全生命周期集。
+    状态列 = 索引生命周期 + 渲染派生标注（(stale) / (unregistered)，
+    §6.4 B-3 / §7.4 H-3）。
+    """
+    cols = [("ID", 18), ("状态", 30), ("标题", 30), ("FROM→TO", 15), ("相对时间", 12)]
+    if leading_blank:
+        print()
     print(_table_row(cols))
     print("-" * 56)
     if not rows:
-        print("（暂无 handoff 记录）")
+        print(empty_text)
         return
     for r in rows:
-        route = f"{r['from'] or '-'}→{r['to'] or '-'}"
+        route = f"{r.get('from') or '-'}→{r.get('to') or '-'}"
+        if r.get("ghost"):
+            status_text = f"{r.get('status') or '-'} (ghost)"
+        else:
+            status_text = _handoff_status_display(
+                r.get("status"), r.get("stale"), r.get("unregistered"))
         cells = [
-            (str(r["id"] or ""), cols[0][1]),
-            (str(r["status"] or "-"), cols[1][1]),
-            (truncate(r["title"], cols[2][1]), cols[2][1]),
+            (str(r.get("id") or ""), cols[0][1]),
+            (status_text, cols[1][1]),
+            (truncate(r.get("title"), cols[2][1]), cols[2][1]),
             (route, cols[3][1]),
-            (relative_time(r["created"]), cols[4][1]),
+            (relative_time(r.get("created")), cols[4][1]),
         ]
         print(_table_row(cells))
 
@@ -1361,10 +1416,143 @@ def cmd_inject(args):
 
 
 # ---------------------------------------------------------------------------
-# 未实现子命令（本 plan 只声明，exit 2）
+# pending 双源查询（§7.4 H-3：目录扫描 ∩ 索引状态）
+#
+#   pending 的真值 = 目录扫描（文件存在）∩ 索引状态（非 consumed/stale）。
+#   目录答"文件在不在"，索引答"生命周期到哪了"。行源永远是目录扫描：
+#     - 索引 pending → 正常行
+#     - 索引 consumed/re_consumed → 排除（文件虽在，生命周期已终）
+#     - 无登记（孤儿：模型写了文档但 register 失败/漏调）→ 视为 pending，
+#       状态列如实标 (unregistered)，不做自动登记（H-3：机器不猜状态）
+#     - 幽灵（有登记无文件）→ 不出行（doctor 范围，§7.4）
+#   stale 按 §6.4 B-3：created 起算 14 天未消费 → 状态列标 stale——渲染时
+#   派生显示，非存储状态；孤儿同样回退 frontmatter.created 判定（§7.4）。
 # ---------------------------------------------------------------------------
 
-NOT_IMPLEMENTED = ("pending", "snapshot", "gc")
+STALE_DAYS = 14  # §6.4 B-3：created 起算 14 天
+
+
+def _scan_handoff_files(cwd, zone=None):
+    """目录扫描 handoffs/<zone>/ -> [handoff 行 dict（仅目录侧事实）]。
+
+    扫描区：--zone=Z 只扫 handoffs/Z/（目录不存在=空集）；省略则扫四区
+    目录（缺者跳过）。每文件读 frontmatter（id/from/to/created），从文件
+    名取 id 元数据、正文 # 一级标题取 title；解析失败的文件跳过（doctor
+    范围，不是 pending 的事）。frontmatter 值为准（§7.4 命名错位：
+    frontmatter.to ≠ 目录名 → doctor 报告，不影响本表读取）。
+    """
+    root = handoffs_dir(cwd)
+    zones = (zone,) if zone else ZONES
+    rows = []
+    for z in zones:
+        zdir = os.path.join(root, z)
+        if not os.path.isdir(zdir):
+            continue
+        for entry in sorted(os.listdir(zdir)):
+            if not entry.endswith(".md"):
+                continue
+            path = os.path.join(zdir, entry)
+            if not os.path.isfile(path):
+                continue
+            # 元数据取文件名 id（目录扫描侧唯一可信锚点；与 frontmatter
+            # id 冲突属 doctor 范围，此处不猜）
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    fm, body_lines = parse_frontmatter(fh.read())
+            except (FrontmatterError, OSError):
+                continue  # 损坏/不可读 → 跳过收集，doctor 报告
+            hid = entry[:-len(".md")]
+            rows.append({
+                "id": hid,
+                "from": fm.get("from"),
+                "to": fm.get("to"),
+                "created": fm.get("created"),
+                "title": _handoff_title(body_lines, hid),
+                "_zone_dir": z,  # 所在目录名（渲染 FROM→TO 用 frontmatter）
+            })
+    rows.sort(key=lambda r: r["created"] or "")
+    return rows
+
+
+def _derive_items(cwd, zone=None):
+    """目录扫描行 -> 附录 A items（目录源 ∩ 索引状态，§7.4 双源合并）。
+
+    每行状态列查索引回填（_replay_handoffs 现值）：无登记 → 孤儿
+    unregistered；consumed/re_consumed → 排除（pending 语义 = 未消费；
+    list 全量视图另行合并，不走本函数）。stale 派生不写事件。
+    """
+    events, _ = read_events(cwd)
+    states = _replay_handoffs(events)
+    now = datetime.now().astimezone()
+
+    items = []
+    for row in _scan_handoff_files(cwd, zone):
+        hid = row["id"]
+        status = "pending"
+        unregistered = False
+        if hid in states:
+            status = states[hid].get("status") or "pending"
+            if status in ("consumed", "re_consumed"):
+                continue  # pending 语义 = 未消费（不含生命周期已终的）；list 显式收
+        else:
+            unregistered = True  # 孤儿：有文件无登记（不自动登记，H-3）
+        items.append({
+            "id": hid,
+            "from": row["from"],
+            "to": row["to"],
+            "status": status,
+            "title": row["title"],
+            "created": row["created"],
+            "stale": _is_stale(row["created"], now),
+            "unregistered": unregistered,
+        })
+    return items
+
+
+def _is_stale(created, now=None):
+    """created + 14d < now（§6.4 B-3：渲染时派生，非存储状态）。
+
+    created 是孤儿行（frontmatter 直读）与已登记行共同的唯一时间源——
+    索引事件不带 created 字段，§7.4 孤儿判定回退 frontmatter.created。
+    created 缺失/非法 → 视为未 stale（显示层不因数据污点翻车）。
+    """
+    now = now or datetime.now().astimezone()
+    try:
+        then = datetime.fromisoformat(created)
+    except (TypeError, ValueError):
+        return False
+    deadline = then.astimezone() + timedelta(days=STALE_DAYS)
+    return deadline < now
+
+
+def _handoff_status_display(status, stale, unregistered):
+    """状态列渲染：生命周期状态 + 派生标注（§5 状态列口径）。"""
+    text = status or "-"
+    if stale:
+        text += " (stale)"
+    if unregistered:
+        text += " (unregistered)"
+    return text
+
+
+def _render_pending_table(items):
+    """pending 表（§5 列序：ID、状态、标题、FROM→TO、相对时间）——复用
+    _render_handoff_table，仅空集文案与无前导空行不同（pending 是独立输出，
+    list 的 handoff 段沿用空行分隔）。"""
+    _render_handoff_table(items, empty_text="（暂无未消费 handoff）",
+                          leading_blank=False)
+
+
+def cmd_pending(args):
+    """zone pending [--zone=Z]：未消费 handoff = 目录扫描 ∩ 索引状态（§7.4）。"""
+    if args.zone is not None and args.zone not in ZONES:
+        return fail("pending", f"未知区：{args.zone}（四区封闭集合：{'/'.join(ZONES)}）",
+                    EXIT_BAD_DEF, args.json)
+    items = _derive_items(os.getcwd(), args.zone)
+    if args.json:
+        return emit_ok("pending", {"items": [dict(it) for it in items]})
+    _render_pending_table(items)
+    return EXIT_OK
 
 
 def make_stub(cmd_name):
@@ -1428,7 +1616,7 @@ def build_parser():
 
     p = add("pending", "仅未消费 handoff（目录扫描 ∩ 索引状态）")
     p.add_argument("--zone", dest="zone", help="限定区（chore/core/discuss/maint）")
-    p.set_defaults(func=make_stub("pending"))
+    p.set_defaults(func=cmd_pending)
 
     p = add("register", "校验 frontmatter 合法并登记索引")
     p.add_argument("file", help="handoff 文档路径")
@@ -1464,9 +1652,25 @@ def build_parser():
     return parser
 
 
+def _fix_global_json(argv):
+    """全局前置 --json 归一化到子命令后（附录 A：两位置均接受）。
+
+    argparse 双 parents（全局 + 子命令同 dest）解析怪癖：`zone --json pending`
+    里全局 flag 已消耗，但子 parser 的 store_true 默认 False 覆盖同一 dest
+    → json=False。归一化：--json 从全局位移到子命令名后，单处定义生效。
+    """
+    if argv and argv[0] == "--json":
+        rest = argv[1:]
+        if rest:  # 空命令行交给 argparse 报用法错
+            return [rest[0], "--json"] + rest[1:]
+    return argv
+
+
 def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    if argv is None:
+        argv = sys.argv[1:]
+    args = parser.parse_args(_fix_global_json(argv))
     if getattr(args, "func", None) is None:
         parser.print_help(sys.stderr)
         return EXIT_USAGE
