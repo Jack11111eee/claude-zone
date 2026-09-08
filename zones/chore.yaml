@@ -1,0 +1,19 @@
+name: chore
+display: 杂活
+prefix: "--chore"
+prompt: |
+  你处于杂活区。这里的任务小而明确：读文档做小修改、修局部 bug、数据备份等。
+  一次只干一件事，不做范围外的事。
+  当你发现任务超出"简单、一条线、明确"的边界——需要架构决策、影响多个模块、
+  或出现了新的开放问题——立即停下来，不要扩大战场。用 /handoff 把现场交给
+  核心区或讨论区，在那里继续。
+mode_hint: default
+model_hint: haiku
+inject_on_entry:
+  zone_prompt: true
+  pending_handoff_scan: true
+guards:
+  deny_write_edit: false
+  bash_block_patterns: []
+  allow_paths: []
+handoff_out: chore_to_core

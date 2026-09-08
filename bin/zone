@@ -1,0 +1,2069 @@
+#!/usr/bin/env python3
+"""zone — zoning 插件唯一可执行（纯 Python 标准库，单文件）。
+
+契约（DESIGN.md §5 / §13 附录 A）：
+  成功: {"ok": true,  "v": 1, "cmd": "<cmd>", "data": {...}}
+  失败: {"ok": false, "v": 1, "cmd": "<cmd>", "error": "...", "exit": N}
+退出码：0 成功；2 用法错误；3 找不到匹配的 handoff；4 定义非法。
+
+01-01：公共框架 + `title`（§3 命名语法与归一化）。
+01-03：sidecar 索引引擎（§7.1/§7.2：slug 路径 / append / 重放）+ `which` + `list`
+       + 内部子命令 `_register-session`（M-5：hook 薄封装的登记入口）。
+02-01：受限 yaml 解析器（纯标准库，§8 schema 子集）+ `show`（覆盖式合并视图，
+       Q-4 深合并）+ `doctor`（内置定义校验 / P-6 第五区 / B-6 未知字段）。
+02-02：内部子命令 `_zone-prompt`（prompt 从合并定义取全文）+ `_zap-title`
+       （/zone 换区：transcript 首条用户消息取名 M-3 + source:command 事件）。
+03-01：handoff 生命周期引擎（§6.2 frontmatter 受限解析 + register 校验登记
+       M-1 写入=登记原子、无移动语义 + inject 消费 R-5 --force→re_consumed、
+       幽灵 exit 3、B-1 跨区允许）。
+03-02：pending 双源查询（§7.4：目录扫描 ∩ 索引状态）+ list 的 handoff
+       全量视图（目录行状态回填、孤儿 (unregistered)、幽灵如实列、stale
+       按 §6.4 B-3 渲染时派生——created 起算 14 天，不写事件）。
+03-03：doctor 一致性检查（§7.4 孤儿/幽灵/命名错位三类 + §7.2 L-2 索引
+       坏行报告；read_events 坏行收集扩为 {line, raw} 供 doctor 消费，
+       其余读取方不受影响——只报告，不修复，机器不猜状态）。
+04-01：`_check-guard write`（§9 PreToolUse 行：判区 by sessionId → 合并
+       定义 deny_write_edit → allow_paths glob carve-out 自实现，
+       ** 跨段 / * 段内 / 其余字面——纯 stdlib fnmatch 不够；GUARD-03
+       degrade-to-open：无会话 id / 未登记 unzoned 一律放行，exit 恒 0）。
+04-02：`_check-guard bash`（§9 PreToolUse Bash 行 + GUARD-02/04：判区同构，
+       该区合并定义 guards.bash_block_patterns（§8.2 L-6 七条正则 list，
+       含 --force 负向前瞻（后面不再跟非空白字符）——--force-with-lease
+       保护性操作放行）逐条 re.search on command 字符串 → 命中 deny
+05-01：`snapshot`（§5 M-2：git 现场块——branch/porcelain/log -5/分支
+       清单四小节，纯机器产物，非 git 目录优雅降级单行）+ `gc`
+       （§6.4 B-3：created 起算 stale_days 天过期即移入 handoffs/.trash/，
+       不论 pending 与否；shutil.move 永不 unlink，同名冲突加 -1/-2 尾缀）。
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import unicodedata
+from datetime import datetime, timedelta
+
+# 四区封闭集合（DESIGN.md §2，P-6：不可增删分区）
+ZONES = ("chore", "core", "discuss", "maint")
+
+# 退出码（DESIGN.md §5）
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_NOT_FOUND = 3
+EXIT_BAD_DEF = 4
+
+VERSION = "0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# 输出契约（附录 A）
+# ---------------------------------------------------------------------------
+
+def emit_ok(cmd, data):
+    print(json.dumps(
+        {"ok": True, "v": 1, "cmd": cmd, "data": data},
+        ensure_ascii=False,
+    ))
+    return EXIT_OK
+
+
+def emit_error(cmd, error, exit_code):
+    print(json.dumps(
+        {"ok": False, "v": 1, "cmd": cmd, "error": error, "exit": exit_code},
+        ensure_ascii=False,
+    ))
+    return exit_code
+
+
+def fail(cmd, error, exit_code, as_json):
+    """失败输出：--json 走附录 A 契约，否则 stderr 人类可读。"""
+    if as_json:
+        # 契约输出始终走 stdout（机器消费）
+        return emit_error(cmd, error, exit_code)
+    print(f"zone: {error}", file=sys.stderr)
+    return exit_code
+
+
+# ---------------------------------------------------------------------------
+# title：前缀判定 + [zone] 旧语法归一化（DESIGN.md §3）
+# ---------------------------------------------------------------------------
+
+def parse_title(title):
+    """title 字符串 -> (zone, rest, normalized)。
+
+    - (a) 标题以 `--<zone> ` 开头且 zone 恰为四区之一 -> 该区。
+    - (b) 残留 `[zone] ` 旧语法（zone 恰为四区之一）-> 归一化为新前缀。
+    - (c) 其余 -> unzoned（zone=None，输出层呈现为 "unzoned"）。
+    """
+    zone, rest, normalized = None, title, False
+
+    # (a) `--<zone> ` 前缀，zone 名必须恰为四区之一（双重判据，误判面小）
+    for z in ZONES:
+        prefix = f"--{z} "
+        if title.startswith(prefix):
+            zone = z
+            rest = title[len(prefix):]
+            break
+
+    # (b) 残留 `[zone] ` 旧语法 -> 归一化（[] 是 shell glob 字符类，硬伤）
+    if zone is None:
+        for z in ZONES:
+            legacy = f"[{z}] "
+            if title.startswith(legacy):
+                zone = z
+                rest = title[len(legacy):]
+                normalized = True
+                break
+
+    return zone, rest, normalized
+
+
+def cmd_title(args):
+    zone, rest, normalized = parse_title(args.title)
+    if zone is None:
+        if args.json:
+            return emit_ok("title", {"zone": "unzoned", "rest": rest, "normalized": normalized})
+        print("unzoned")
+        return EXIT_OK
+    if args.json:
+        return emit_ok("title", {"zone": zone, "rest": rest, "normalized": normalized})
+    print(f"zone: {zone}, rest: {rest}")
+    if normalized:
+        print(f"normalized: --{zone} 前缀（原 [zone] 旧语法）")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# sidecar 索引引擎（DESIGN.md §7.1 布局 / §7.2 事件 schema）
+#
+#   ~/.claude/zoning/<project-slug>/index.jsonl   append-only 事件流
+#   ~/.claude/zoning/<project-slug>/handoffs/<zone>/   ×4
+#   ~/.claude/zoning/<project-slug>/handoffs/.trash/
+#
+# slug 规则同 ~/.claude/projects：cwd 绝对路径中非 [A-Za-z0-9] 字符逐个替换为 -。
+# 环境变量 ZONING_HOME 可覆盖 ~/.claude（测试用，不进文档契约）。
+# ---------------------------------------------------------------------------
+
+def project_slug(cwd):
+    """cwd 绝对路径 -> project slug（非 [A-Za-z0-9] 逐字符替换为 -，§7.1）。"""
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(cwd))
+
+
+def zoning_dir(cwd):
+    """cwd -> 该项目的 sidecar 数据目录（ZONING_HOME 覆盖 ~/.claude）。"""
+    home = os.environ.get("ZONING_HOME")
+    base = home if home else os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "zoning", project_slug(cwd))
+
+
+def index_path(cwd):
+    return os.path.join(zoning_dir(cwd), "index.jsonl")
+
+
+def handoffs_dir(cwd):
+    """cwd -> 该项目 handoffs/ 根目录（§7.1；register 前缀校验 / inject 定位用）。"""
+    return os.path.join(zoning_dir(cwd), "handoffs")
+
+
+def ensure_layout(cwd):
+    """确保目录骨架存在（index.jsonl 与 handoffs/<zone>/×4 与 .trash/，§7.1）。"""
+    zdir = zoning_dir(cwd)
+    paths = [zdir, os.path.join(zdir, "index.jsonl")]
+    for zone in ZONES:
+        paths.append(os.path.join(zdir, "handoffs", zone))
+    paths.append(os.path.join(zdir, "handoffs", ".trash"))
+    for path in paths:
+        if path.endswith(".jsonl"):
+            if not os.path.exists(path):
+                with open(path, "a", encoding="utf-8"):
+                    pass
+        elif not os.path.isdir(path):
+            os.makedirs(path, exist_ok=True)
+    return zdir
+
+
+def now_iso():
+    """本地时区 ISO8601 带偏移（§7.2 ts 字段）。"""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def append_event(cwd, event):
+    """单行 JSON append（open(..., "a")；并发容忍靠单行语义，§7.2 L-2）。"""
+    ensure_layout(cwd)
+    with open(index_path(cwd), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def read_events(cwd):
+    """重放 index.jsonl：逐行 json.loads，坏行跳过收集（doctor 消费）。
+
+    返回 (events, skipped)；skipped 项形如 {"line": N, "raw": "<原行文本>"}
+    （行号从 1 起，空行不计）。which/list/pending/inject 等读取方忽略
+    skipped（L-2 容忍），doctor 将其落为问题条目（03-03）。
+    """
+    path = index_path(cwd)
+    events, skipped = [], []
+    if not os.path.exists(path):
+        return events, skipped
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                skipped.append({"line": lineno, "raw": line})
+                continue
+            if isinstance(obj, dict):
+                events.append(obj)
+            else:
+                skipped.append({"line": lineno, "raw": line})
+    return events, skipped
+
+
+def replay_sessions(events):
+    """事件流 -> {sessionId: 最后一条 session 事件}（同 key 后事件即现值）。"""
+    current = {}
+    for ev in events:
+        if ev.get("type") == "session":
+            sid = ev.get("sessionId")
+            if sid:
+                current[sid] = ev
+    return current
+
+
+def relative_time(ts, now=None):
+    """ISO8601 ts -> 中文相对时间（list 表格渲染用）。"""
+    now = now or datetime.now().astimezone()
+    try:
+        then = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return "—"
+    delta = (now - then).total_seconds()
+    if delta < 0:
+        delta = 0
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return f"{int(delta // 60)}分钟前"
+    if delta < 86400:
+        return f"{int(delta // 3600)}小时前"
+    return f"{int(delta // 86400)}天前"
+
+
+def truncate(text, width=24):
+    """标题截断（表格列宽内；按显示宽度，中文计 2 列）。"""
+    if text is None:
+        return ""
+    text = str(text)
+    if display_width(text) <= width:
+        return text
+    out, w = "", 0
+    for ch in text:
+        cw = _char_width(ch)
+        if w + cw > width - 1:
+            break
+        out += ch
+        w += cw
+    return out + "…"
+
+
+def _char_width(ch):
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def display_width(text):
+    return sum(_char_width(ch) for ch in str(text))
+
+
+def _table_row(cells):
+    """[(text, width), ...] -> 按显示宽度对齐后的表格行（中文计 2 列）。"""
+    parts = []
+    for text, width in cells:
+        pad = width - display_width(text)
+        parts.append(str(text) + " " * max(pad, 1))
+    return "".join(parts).rstrip()
+
+
+# ---------------------------------------------------------------------------
+# _register-session（内部子命令，M-5：SessionStart hook 的薄封装登记入口）
+# ---------------------------------------------------------------------------
+
+def cmd_register_session(args):
+    """stdin JSON -> session 事件 append（unzoned 零动作 exit 0）。
+
+    stdin 字段（Claude Code hook 实际字段名）：session_id / session_title /
+    cwd / source。索引事件 schema 用 §7.2 拼写（sessionId），此处映射。
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return fail("_register-session", "stdin 不是合法 JSON", EXIT_USAGE, args.json)
+
+    session_id = payload.get("session_id") or ""
+    session_title = payload.get("session_title") or ""
+    cwd = payload.get("cwd") or os.getcwd()
+
+    zone, rest, normalized = parse_title(session_title)
+    if zone is None:
+        # unzoned：静默纯 CC（§3），零动作
+        if args.json:
+            return emit_ok("_register-session", {"zone": "unzoned", "appended": False})
+        return EXIT_OK
+
+    # 归一化后的完整标题写进事件（残留 [zone] 旧语法即修正为 --zone）
+    title = f"--{zone} {rest}" if rest else f"--{zone}"
+
+    event = {
+        "v": 1,
+        "ts": now_iso(),
+        "type": "session",
+        "sessionId": session_id,
+        "zone": zone,
+        "title": title,
+        "cwd": cwd,
+        "source": payload.get("source") or "prefix",
+    }
+    append_event(cwd, event)
+
+    if args.json:
+        return emit_ok("_register-session", {
+            "zone": zone, "title": title, "sessionId": session_id, "appended": True,
+        })
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# _zone-prompt（内部子命令，M-5：hook 注入的唯一 prompt 来源）
+# ---------------------------------------------------------------------------
+
+def zone_prompt_text(zone, repo_root=None):
+    """区名 -> prompt 全文（经 load_zone_def 合并管线，§4 M-5 单一实现）。
+
+    未知区 / 解析失败抛 ZoneDefError。
+    """
+    data = load_zone_def(zone, repo_root)
+    prompt = data.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ZoneDefError(f"prompt 字段缺失或为空（{zone}）")
+    return prompt
+
+
+def cmd_zone_prompt(args):
+    try:
+        prompt = zone_prompt_text(args.zone_name)
+    except ZoneDefError as exc:
+        return fail("_zone-prompt", str(exc), EXIT_BAD_DEF, args.json)
+    if args.json:
+        return emit_ok("_zone-prompt", {"zone": args.zone_name, "prompt": prompt})
+    print(prompt, end="")  # prompt 本身以 \n 收尾（块标量 clip）
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# _zap-title（内部子命令，M-3/M-5：/zone 换区的 title 修订 + 索引登记）
+# ---------------------------------------------------------------------------
+
+_ZONE_PROMPT_RE = re.compile(r"^/zone\s+(\S+)$")
+
+
+def _first_user_text(transcript_path):
+    """transcript jsonl -> 首条用户消息文本（M-3：title 名称来源）。
+
+    逐行 json.loads（坏行跳过），取首条 type=="user" 的 message.content：
+    字符串直接用；列表取首个含 text 的块（tool_result 干扰排除）。找不到、
+    路径缺失或不可读 -> None。
+    """
+    if not transcript_path:
+        return None
+    try:
+        fh = open(transcript_path, encoding="utf-8")
+    except (OSError, TypeError):
+        return None
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict) or obj.get("type") != "user":
+                continue
+            content = (obj.get("message") or {}).get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = next((b.get("text") for b in content
+                             if isinstance(b, dict) and isinstance(b.get("text"), str)), None)
+            else:
+                text = None
+            if text is not None and text.strip():
+                return text.strip()
+    return None
+
+
+def _title_from_transcript(text, zone):
+    """首条用户消息 -> 修订 title：截 ~40 字、去换行，前缀补 --<zone>。"""
+    if text:
+        name = re.sub(r"\s+", " ", text).strip()[:40]
+    else:
+        name = datetime.now().strftime("%m-%d")  # 空/解析失败 → --<zone> <MM-DD>
+    return f"--{zone} {name}"
+
+
+def cmd_zap_title(args):
+    """stdin JSON {session_id, cwd, transcript_path, zone(?)} -> 换区登记。
+
+    目标区：stdin zone 字段（hook 透传），缺省从 stdin prompt 的 /zone 参数取。
+    归一化（[core]→--core）后 append session 事件（source: "command"，§4 换区
+    = 追加事件、后事件覆盖前事件）。输出修订后的 title。
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return fail("_zap-title", "stdin 不是合法 JSON", EXIT_USAGE, args.json)
+
+    session_id = payload.get("session_id") or ""
+    cwd = payload.get("cwd") or os.getcwd()
+    zone = payload.get("zone")
+    if not zone:
+        m = _ZONE_PROMPT_RE.match(payload.get("prompt") or "")
+        zone = m.group(1) if m else None
+    if not zone or zone not in ZONES:
+        return fail("_zap-title",
+                    f"目标区缺失或非法：{zone!r}（stdin zone 字段或 prompt /zone 参数，四区：{'/'.join(ZONES)}）",
+                    EXIT_USAGE, args.json)
+
+    # M-3：名称=transcript 首条用户消息（截 ~40 去）；[zone] 旧语法残留在此归一化
+    title = _title_from_transcript(_first_user_text(payload.get("transcript_path")), zone)
+    name_zone, rest, _ = parse_title(title)
+    if name_zone != zone or not rest:  # 截断撞不出前缀歧义，防御归一化
+        title = f"--{zone} {rest or title}"
+
+    event = {
+        "v": 1,
+        "ts": now_iso(),
+        "type": "session",
+        "sessionId": session_id,
+        "zone": zone,
+        "title": title,
+        "cwd": cwd,
+        "source": "command",  # §7.2：/zone 补救归属可审计来源
+    }
+    append_event(cwd, event)
+
+    if args.json:
+        return emit_ok("_zap-title", {
+            "zone": zone, "title": title, "sessionId": session_id, "source": "command",
+        })
+    print(title)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# which：会话归属查询（§7.3）
+# ---------------------------------------------------------------------------
+
+def cmd_which(args):
+    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not session_id:
+        return fail(
+            "which",
+            "缺少会话 id：--session <id> 或环境变量 CLAUDE_CODE_SESSION_ID",
+            EXIT_USAGE,
+            args.json,
+        )
+
+    cwd = args.cwd or os.getcwd()
+    events, _ = read_events(cwd)
+    current = replay_sessions(events)
+    ev = current.get(session_id)
+
+    if ev is None:
+        if args.json:
+            return emit_ok("which", {"zone": "unzoned", "title": None, "source": None})
+        print("unzoned")
+        return EXIT_OK
+
+    zone = ev.get("zone") or "unzoned"
+    if args.json:
+        return emit_ok("which", {
+            "zone": zone,
+            "title": ev.get("title"),
+            "source": ev.get("source"),
+        })
+    print(zone)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# list：会话与 handoff 索引摘要（§5 契约表）
+# ---------------------------------------------------------------------------
+
+def cmd_list(args):
+    if args.zone is not None and args.zone not in ZONES:
+        return fail("list", f"未知区：{args.zone}（四区封闭集合：{'/'.join(ZONES)}）",
+                    EXIT_BAD_DEF, args.json)
+
+    cwd = os.getcwd()
+    events, _ = read_events(cwd)
+    sessions = replay_sessions(events)
+
+    rows = []
+    for sid, ev in sessions.items():
+        zone = ev.get("zone") or "unzoned"
+        if args.zone and zone != args.zone:
+            continue
+        rows.append({
+            "sessionId": sid,
+            "zone": zone,
+            "title": ev.get("title") or "",
+            "ts": ev.get("ts"),
+        })
+    # 最新登记在前（ts 倒序；无 ts 的兜底排尾）
+    rows.sort(key=lambda r: r["ts"] or "", reverse=True)
+
+    # handoff 全量视图（03-02）：目录扫描行（含 consumed/re_consumed，状态
+    # 列按索引回填、孤儿 (unregistered)）∪ 幽灵行（索引有登记但文件不在——
+    # pending 不收，list 如实报告索引现值，标 (ghost)）
+    handoff_rows = _list_handoff_rows(events, args.zone)
+
+    if args.json:
+        items = []
+        for r in rows:
+            items.append({
+                "id": r["sessionId"],
+                "zone": r["zone"],
+                "title": r["title"],
+                "ts": r["ts"],
+            })
+        for h in handoff_rows:
+            items.append({
+                "id": h["id"],
+                "from": h["from"],
+                "to": h["to"],
+                "status": h["status"],
+                "title": h["title"],
+                "created": h["created"],
+                "stale": h["stale"],
+                "unregistered": h["unregistered"],
+            })
+        return emit_ok("list", {"items": items})
+
+    _render_session_table(rows)
+    _render_handoff_table(handoff_rows)
+    return EXIT_OK
+
+
+def _list_handoff_rows(events, zone=None):
+    """list 的 handoff 全量行（§5「list 列 handoff 与会话索引摘要」）。
+
+    与 pending 的差别：consumed/re_consumed 不排除（全生命周期）+ 幽灵行
+    （索引有登记无文件）如实列出（pending 静默略过，§7.4 幽灵=doctor 范围；
+    list 是巡视总览，报告比隐藏好）。目录行重用 _scan_handoff_files（时序）
+    与 _replay_handoffs（状态回填）；幽灵行的 from/to/title/created 取索引
+    合并现值（registered 事件携带，§7.2）。
+    """
+    cwd = os.getcwd()
+    states = _replay_handoffs(events)
+    now = datetime.now().astimezone()
+
+    rows = []
+    for row in _scan_handoff_files(cwd, zone):
+        hid = row["id"]
+        state = states.get(hid, {})
+        rows.append({
+            "id": hid,
+            "from": row["from"] if row["from"] is not None else state.get("from"),
+            "to": row["to"] if row["to"] is not None else state.get("to"),
+            "status": state.get("status") or "pending",
+            "title": row["title"] if row["title"] != hid else state.get("title", row["title"]),
+            "created": row["created"] or state.get("ts"),
+            "stale": _is_stale(row["created"], now),
+            "unregistered": hid not in states,
+        })
+
+    ids_on_disk = {r["id"] for r in rows}
+    for hid, state in states.items():
+        if hid in ids_on_disk:
+            continue  # 幽灵：索引登记但目录无文件（§7.4；inject 遇它 exit 3）
+        to = state.get("to")
+        if zone and to != zone:
+            continue
+        status = state.get("status") or "pending"
+        rows.append({
+            "id": hid,
+            "from": state.get("from"),
+            "to": to,
+            "status": status,
+            "title": state.get("title") or "",
+            "created": state.get("ts"),  # 幽灵无文件：created 取登记事件 ts
+            "stale": False,
+            "unregistered": False,
+            "ghost": True,  # pending 不收（doctor），list 如实报告
+        })
+    return rows
+
+
+def _replay_handoffs(events):
+    """索引流 -> {handoff id: 合并状态}。
+
+    生命周期的"现值"取同 id 最后一条事件（§7.2 后事件覆盖语义）；但
+    from/to/title 只在首个登记事件出现，状态迁移事件（consumed 等）不带
+    ——故按事件顺序做字段级合并，后事件仅覆盖它携带的字段（如 status/by）。
+    """
+    current = {}
+    for ev in events:
+        if ev.get("type") != "handoff":
+            continue
+        hid = ev.get("id")
+        if not hid:
+            continue
+        merged = current.get(hid, {})
+        for key, value in ev.items():
+            if value is not None:
+                merged[key] = value
+        current[hid] = merged
+    return current
+
+
+def _render_session_table(rows):
+    """会话表（§5 list 契约在 M0 的会话段：id(zone)/标题/相对时间）。"""
+    cols = [("区", 8), ("标题", 30), ("相对时间", 12)]
+    print(_table_row(cols))
+    print("-" * 56)
+    for r in rows:
+        zone = r["zone"] or "unzoned"
+        cells = [
+            (zone, cols[0][1]),
+            (truncate(r["title"], cols[1][1]), cols[1][1]),
+            (relative_time(r["ts"]), cols[2][1]),
+        ]
+        print(_table_row(cells))
+
+
+def _render_handoff_table(rows, empty_text="（暂无 handoff 记录）", leading_blank=True):
+    """handoff 表（§5 列：ID、状态、标题、FROM→TO、相对时间）。
+
+    pending 与 list 共用：pending 传未消费子集，list 传全生命周期集。
+    状态列 = 索引生命周期 + 渲染派生标注（(stale) / (unregistered)，
+    §6.4 B-3 / §7.4 H-3）。
+    """
+    cols = [("ID", 18), ("状态", 30), ("标题", 30), ("FROM→TO", 15), ("相对时间", 12)]
+    if leading_blank:
+        print()
+    print(_table_row(cols))
+    print("-" * 56)
+    if not rows:
+        print(empty_text)
+        return
+    for r in rows:
+        route = f"{r.get('from') or '-'}→{r.get('to') or '-'}"
+        if r.get("ghost"):
+            status_text = f"{r.get('status') or '-'} (ghost)"
+        else:
+            status_text = _handoff_status_display(
+                r.get("status"), r.get("stale"), r.get("unregistered"))
+        cells = [
+            (str(r.get("id") or ""), cols[0][1]),
+            (status_text, cols[1][1]),
+            (truncate(r.get("title"), cols[2][1]), cols[2][1]),
+            (route, cols[3][1]),
+            (relative_time(r.get("created")), cols[4][1]),
+        ]
+        print(_table_row(cells))
+
+
+# ---------------------------------------------------------------------------
+# zone.yaml 定义体系（§8：受限 yaml 解析 + 覆盖式合并 Q-4 + doctor 校验）
+#
+# 纯标准库约束：插件运行环境无 PyYAML 保证，故自实现受限子集解析器。
+# 支持形态（恰覆盖 zones/*.yaml 的 schema 子集）：
+#   - flat key：标量值（bool / 裸串 / 单引号 / 双引号 / 空流列表 []）
+#   - 一层嵌套 dict（inject_on_entry / guards）
+#   - 字符串列表（- "x" / - 'x' / - x，缩进比子键深一层）
+#   - 块标量 prompt（`key: |` 后跟更深缩进正文，保留换行）
+#   - 注释行（# 开头）与空行跳过（块标量内部按 YAML 语义原样保留）
+# 遇到子集外形态（锚点 / 多文档 / tab 缩进 / 二级嵌套等）抛 ZoneDefError。
+# ---------------------------------------------------------------------------
+
+# §8 允许字段集合（B-6：schema 外字段不静默——doctor 报错、show exit 4）
+ZONE_TOP_FIELDS = ("name", "display", "prefix", "prompt", "mode_hint",
+                   "model_hint", "inject_on_entry", "guards", "handoff_out")
+GUARD_FIELDS = ("deny_write_edit", "allow_paths", "bash_block_patterns")
+INJECT_FIELDS = ("zone_prompt", "pending_handoff_scan")
+
+
+class ZoneDefError(Exception):
+    """zone.yaml 解析/校验失败（§8）；show 消费为 exit 4，doctor 消费为问题条目。"""
+
+
+def _indent_width(raw, lineno):
+    """行前导空格数；tab 缩进记非法（受限子集只允许空格）。"""
+    stripped = raw.lstrip(" ")
+    if stripped.startswith("\t"):
+        raise ZoneDefError(f"第 {lineno} 行：缩进含 tab（只允许空格）")
+    return len(raw) - len(stripped)
+
+
+_DQ_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "0": "\0"}
+
+
+def _parse_scalar(token, lineno):
+    """受限标量：bool / 空流列表 [] / 双引号 / 单引号 / 裸字符串。
+
+    双引号按 YAML 语义处理转义（\\\\ → \\，\\" → " 等；未定义转义原样保留
+    反斜杠——历史教训：双引号里的 \\s 不得畸变为 s 或 \\\\s）。单引号按
+    YAML 语义不处理转义（仅 '' → '，正则模式零畸变）。
+    """
+    if token == "[]":
+        return []
+    if token.startswith(("[", "{", "]", "}", ",")):
+        raise ZoneDefError(
+            f"第 {lineno} 行：流式集合语法不在受限子集内（仅允许空列表 []）：{token[:30]}")
+    if token in ("true", "false"):
+        return token == "true"
+    if token.startswith('"') or token.startswith("'"):
+        if len(token) < 2 or not token.endswith(token[0]):
+            raise ZoneDefError(f"第 {lineno} 行：引号未闭合：{token[:30]}")
+        if token[0] == "'":
+            return token[1:-1].replace("''", "'")
+        body = token[1:-1]
+        out = []
+        i = 0
+        while i < len(body):
+            ch = body[i]
+            if ch != "\\":
+                out.append(ch)
+                i += 1
+                continue
+            if i + 1 >= len(body):
+                raise ZoneDefError(f"第 {lineno} 行：孤立的转义反斜杠")
+            nxt = body[i + 1]
+            out.append(_DQ_ESCAPES.get(nxt, "\\" + nxt))
+            i += 2
+        return "".join(out)
+    return token
+
+
+def _parse_block_scalar(lines, i):
+    """`key: |` 正文：收集比顶层 key 更深缩进的行（含内部空行）。
+
+    返回 (value, next_i)。换行保留；首尾空行丢弃；按最小缩进 dedent。
+    """
+    block = []
+    n = len(lines)
+    while i < n:
+        raw = lines[i]
+        if not raw.strip():
+            block.append(None)  # 空行占位（块尾的被裁掉，块中保留为空行）
+            i += 1
+            continue
+        if _indent_width(raw, i + 1) == 0:
+            break
+        block.append(raw)
+        i += 1
+    while block and block[-1] is None:
+        block.pop()
+    while block and block[0] is None:
+        block.pop(0)
+    bodies = [b for b in block if b is not None]
+    if not bodies:
+        return "", i
+    base = min(len(b) - len(b.lstrip(" ")) for b in bodies)
+    joined = "\n".join("" if b is None else b[base:] for b in block)
+    # YAML `|`（clip chomping）：正文后恰保留一个换行
+    return joined + "\n", i
+
+
+def _parse_section(lines, i, head_lineno):
+    """一层嵌套 dict 正文（guards: / inject_on_entry: 之后）-> (dict, next_i)。
+
+    子值支持：标量 / 空流列表 [] / 字符串列表（- x，缩进比子键深）。
+    """
+    n = len(lines)
+    sub = {}
+    sub_indent = None
+    while i < n:
+        raw = lines[i]
+        lineno = i + 1
+        content = raw.strip()
+        if not content or content.startswith("#"):
+            i += 1
+            continue
+        indent = _indent_width(raw, lineno)
+        if indent == 0:
+            break
+        if sub_indent is None:
+            sub_indent = indent
+        elif indent != sub_indent:
+            raise ZoneDefError(
+                f"第 {lineno} 行：嵌套缩进不一致（期望 {sub_indent} 列）")
+        if content.startswith("- "):
+            raise ZoneDefError(
+                f"第 {lineno} 行：section 不支持列表项（一层 dict 之外）")
+        key, sep, rest = content.partition(":")
+        key = key.strip()
+        if not sep or not key:
+            raise ZoneDefError(f"第 {lineno} 行：无法解析（期望 key: value）：{content[:40]}")
+        rest = rest.strip()
+        i += 1
+        if rest:
+            sub[key] = _parse_scalar(rest, lineno)
+            continue
+        # 子键值为空：期待字符串列表（更深一层缩进的 - item）
+        items = []
+        item_indent = None
+        while i < n:
+            iraw = lines[i]
+            ilineno = i + 1
+            icontent = iraw.strip()
+            if not icontent or icontent.startswith("#"):
+                i += 1
+                continue
+            iindent = _indent_width(iraw, ilineno)
+            if iindent <= sub_indent:
+                break
+            if not icontent.startswith("- "):
+                raise ZoneDefError(
+                    f"第 {ilineno} 行：{key} 期待列表项（- item），得到：{icontent[:40]}")
+            if item_indent is None:
+                item_indent = iindent
+            elif iindent != item_indent:
+                raise ZoneDefError(
+                    f"第 {ilineno} 行：列表缩进不一致（期望 {item_indent} 列）")
+            items.append(_parse_scalar(icontent[2:].strip(), ilineno))
+            i += 1
+        if not items:
+            raise ZoneDefError(
+                f"第 {lineno} 行：{key} 为空值（期待 `- item` 列表或 `[]`）")
+        sub[key] = items
+    if sub_indent is None:
+        raise ZoneDefError(f"第 {head_lineno} 行：section 为空（期待一层嵌套内容）")
+    return sub, i
+
+
+def parse_zone_yaml(text):
+    """受限 yaml（§8 子集）-> dict。解析不了抛 ZoneDefError。"""
+    lines = text.splitlines()
+    n = len(lines)
+    result = {}
+    i = 0
+    while i < n:
+        raw = lines[i]
+        lineno = i + 1
+        content = raw.strip()
+        if not content or content.startswith("#"):
+            i += 1
+            continue
+        if _indent_width(raw, lineno) != 0:
+            raise ZoneDefError(f"第 {lineno} 行：顶层不允许缩进")
+        if content.startswith("- "):
+            raise ZoneDefError(f"第 {lineno} 行：顶层不支持列表项")
+        key, sep, rest = content.partition(":")
+        key = key.strip()
+        if not sep or not key:
+            raise ZoneDefError(f"第 {lineno} 行：无法解析（期望 key: value）：{content[:40]}")
+        rest = rest.strip()
+        i += 1
+        if rest == "|":
+            value, i = _parse_block_scalar(lines, i)
+            result[key] = value
+        elif rest[:1] in ("|", ">"):
+            raise ZoneDefError(f"第 {lineno} 行：块标量只支持 `|`（得到 {rest}）")
+        elif rest:
+            result[key] = _parse_scalar(rest, lineno)
+        else:
+            sub, i = _parse_section(lines, i, lineno)
+            result[key] = sub
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 载入与合并（Q-4）：内置 zones/<zone>.yaml -> repo .claude/zones/<zone>.yaml
+# ---------------------------------------------------------------------------
+
+def builtin_zones_dir():
+    """内置定义根目录：bin 文件相对 ../zones/（= 插件根/zones/，不依赖 cwd）。"""
+    try:
+        me = __file__
+    except NameError:  # exec(open(...)) 场景兜底
+        me = sys.argv[0] if sys.argv and sys.argv[0] else "zone"
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(me))), "zones")
+
+
+def _deep_merge(base, overlay):
+    """字段级深合并：dict 递归；标量与列表整体替换（Q-4）。"""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_zone_def(zone, repo_root=None):
+    """内置 -> repo 覆盖 -> 合并后 dict（Q-4 方向：repo 覆盖插件默认）。
+
+    未知区名（P-6）、解析失败、覆盖层未知字段（B-6）抛 ZoneDefError。
+    """
+    if zone not in ZONES:
+        raise ZoneDefError(f"未知区：{zone}（四区封闭集合：{'/'.join(ZONES)}，P-6）")
+    repo_root = os.getcwd() if repo_root is None else repo_root
+    builtin_path = os.path.join(builtin_zones_dir(), f"{zone}.yaml")
+    try:
+        with open(builtin_path, encoding="utf-8") as fh:
+            base = parse_zone_yaml(fh.read())
+    except OSError as exc:
+        raise ZoneDefError(f"内置定义不可读：{builtin_path}（{exc}）")
+    overlay_path = os.path.join(repo_root, ".claude", "zones", f"{zone}.yaml")
+    if not os.path.exists(overlay_path):
+        return base
+    try:
+        with open(overlay_path, encoding="utf-8") as fh:
+            overlay = parse_zone_yaml(fh.read())
+    except OSError as exc:
+        raise ZoneDefError(f"覆盖层不可读：{overlay_path}（{exc}）")
+    unknown = _unknown_field_problems(overlay, overlay_path)
+    if unknown:
+        first = unknown[0]
+        raise ZoneDefError(f"{first['file']}：{first['field']}：{first['message']}")
+    return _deep_merge(base, overlay)
+
+
+def _unknown_field_problems(data, rel):
+    """B-6 未知字段检查（不静默）。允许字段集合见 ZONE_TOP_FIELDS 等常量。"""
+    problems = []
+    for key in data:
+        if key not in ZONE_TOP_FIELDS:
+            problems.append({"file": rel, "field": key,
+                             "message": f"未知字段（允许：{'/'.join(ZONE_TOP_FIELDS)}）"})
+    if isinstance(data.get("guards"), dict):
+        for key in data["guards"]:
+            if key not in GUARD_FIELDS:
+                problems.append({"file": rel, "field": f"guards.{key}",
+                                 "message": f"未知字段（guards 允许：{'/'.join(GUARD_FIELDS)}）"})
+    if isinstance(data.get("inject_on_entry"), dict):
+        for key in data["inject_on_entry"]:
+            if key not in INJECT_FIELDS:
+                problems.append({"file": rel, "field": f"inject_on_entry.{key}",
+                                 "message": f"未知字段（inject_on_entry 允许：{'/'.join(INJECT_FIELDS)}）"})
+    return problems
+
+
+def _value_problems(data, rel):
+    """(a) 内置定义字段校验：未知字段 + 类型/值域（前缀一致、guards 值域合法）。"""
+    problems = []
+    name = data.get("name")
+    prefix = data.get("prefix")
+    if not isinstance(name, str) or not name:
+        problems.append({"file": rel, "field": "name",
+                         "message": f"name 缺失或非字符串（得到 {type(name).__name__}）"})
+    elif not isinstance(prefix, str) or not prefix.startswith("--"):
+        problems.append({"file": rel, "field": "prefix",
+                         "message": f"prefix 必须形如 --<name>（得到 {prefix!r}）"})
+    elif prefix != f"--{name}":
+        problems.append({"file": rel, "field": "prefix",
+                         "message": f"prefix 与 name 不一致：应为 --{name}（得到 {prefix}）"})
+    guards = data.get("guards")
+    if guards is not None:
+        if not isinstance(guards, dict):
+            problems.append({"file": rel, "field": "guards",
+                             "message": "guards 必须是映射（一层嵌套）"})
+        else:
+            dw = guards.get("deny_write_edit")
+            if not isinstance(dw, bool):
+                problems.append({"file": rel, "field": "guards.deny_write_edit",
+                                 "message": f"deny_write_edit 必须是 bool（得到 {type(dw).__name__}）"})
+            for sub_key in ("allow_paths", "bash_block_patterns"):
+                value = guards.get(sub_key)
+                if not isinstance(value, list) or any(
+                        not isinstance(x, str) for x in value):
+                    problems.append({"file": rel, "field": f"guards.{sub_key}",
+                                     "message": f"{sub_key} 必须是字符串列表"})
+            patterns = guards.get("bash_block_patterns")
+            if isinstance(patterns, list):
+                for idx, pat in enumerate(patterns):
+                    if not isinstance(pat, str):
+                        continue
+                    try:
+                        re.compile(pat)
+                    except re.error as exc:
+                        problems.append({
+                            "file": rel, "field": f"guards.bash_block_patterns[{idx}]",
+                            "message": f"正则不可编译：{pat!r}（{exc}）"})
+    inject = data.get("inject_on_entry")
+    if inject is not None:
+        if not isinstance(inject, dict):
+            problems.append({"file": rel, "field": "inject_on_entry",
+                             "message": "inject_on_entry 必须是映射（一层嵌套）"})
+        else:
+            for sub_key in ("zone_prompt", "pending_handoff_scan"):
+                value = inject.get(sub_key)
+                if not isinstance(value, bool):
+                    problems.append({
+                        "file": rel, "field": f"inject_on_entry.{sub_key}",
+                        "message": f"必须为 bool（得到 {type(value).__name__}）"})
+    problems.extend(_unknown_field_problems(data, rel))
+    return problems
+
+
+def _load_yaml_for_doctor(path, rel, problems):
+    """读 + 解析单个 yaml；出错落 problem 条目并返回 None。"""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        problems.append({"file": rel, "field": "", "message": f"文件不可读：{exc}"})
+        return None
+    try:
+        return parse_zone_yaml(text)
+    except ZoneDefError as exc:
+        problems.append({"file": rel, "field": "", "message": f"解析失败：{exc}"})
+        return None
+
+
+def doctor_problems(repo_root=None):
+    """doctor 数据采集（附录 A data={problems:[{file,field,message}]}）。
+
+    (a) 四内置定义逐一解析+字段校验；(b) repo 覆盖层第五区名 → P-6 警告；
+    (c) 覆盖层未知字段 → B-6 错误条目。（03-03 起存储一致性三类与索引坏行
+    检查在 _consistency_problems，与本函数并列拼装。）
+    """
+    repo_root = os.getcwd() if repo_root is None else repo_root
+    problems = []
+    builtins = {}
+    for zone in ZONES:
+        rel = f"zones/{zone}.yaml"
+        data = _load_yaml_for_doctor(
+            os.path.join(builtin_zones_dir(), f"{zone}.yaml"), rel, problems)
+        if data is None:
+            continue
+        problems.extend(_value_problems(data, rel))
+        builtins[zone] = data
+    overlay_dir = os.path.join(repo_root, ".claude", "zones")
+    if not os.path.isdir(overlay_dir):
+        return problems
+    for entry in sorted(os.listdir(overlay_dir)):
+        if not entry.endswith(".yaml"):
+            continue
+        rel = f".claude/zones/{entry}"
+        path = os.path.join(overlay_dir, entry)
+        if entry[:-len(".yaml")] not in ZONES:
+            problems.append({
+                "file": rel, "field": "",
+                "message": "第五区名：不在四区封闭集合（P-6），此文件不生效；"
+                           f"允许：{'/'.join(ZONES)}。请删除或迁移"})
+            continue
+        data = _load_yaml_for_doctor(path, rel, problems)
+        if data is None:
+            continue
+        # 覆盖层可只写部分字段（Q-4 深合并）——值域校验作用于合并后定义
+        #（即 show 输出、hook 读入的最终形态），部分覆盖不产生虚假缺失项。
+        merged = _deep_merge(builtins.get(entry[:-len(".yaml")], {}), data)
+        problems.extend(_value_problems(merged, rel))
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# doctor 一致性检查（§7.4 三类 + §7.2 L-2 坏行；03-03）
+#
+#   孤儿：handoffs/ 有文件但索引无该 id 登记事件（模型写了但 register
+#         失败/漏调）→ 提醒人 re-register，不代办（H-3 机器不猜状态）。
+#   幽灵：索引状态 pending/re_consumed 但文件不存在（人手删/移动）→
+#         报告；inject 遇它 exit 3。consumed 豁免（文档可能已被 gc 移入
+#         .trash 或人工归档，正常现象，不误报）。
+#   命名错位：文件所在目录名 ≠ frontmatter.to → 报告（metadata 以
+#         frontmatter 为准，不影响读取）。
+#   索引坏行：read_events 收集的损坏行（L-2 并发 append 碰撞）→ 报告
+#         行号+摘要，不崩。
+#
+# 全部只报告不修复：孤儿修复靠人执行 zone register（机器不猜状态），
+# 索引的保底重建走 reindex 内部重放逻辑（区内部实现，不暴露 CLI）。
+# ---------------------------------------------------------------------------
+
+def _consistency_problems(cwd, events, skipped):
+    """存储一致性检查（§7.4）+ 索引坏行（L-2）→ problems 列表。
+
+    数据源复用：目录侧 _scan_handoff_files（含 frontmatter 与所在目录），
+    索引侧 _replay_handoffs（合并现值），读写两端同一套函数——doctor 与
+    pending/list/inject 看到同一个世界。
+    """
+    problems = []
+    states = _replay_handoffs(events)
+    disk_rows = _scan_handoff_files(cwd)
+    ids_on_disk = {row["id"] for row in disk_rows}
+
+    for row in disk_rows:  # 单次扫描喂孤儿与命名错位两类
+        hid = row["id"]
+        if hid not in states:
+            problems.append({
+                "file": os.path.join("handoffs", row["_zone_dir"], f"{hid}.md"),
+                "field": hid,
+                "message": "孤儿：未登记。修复：zone register <file>"
+                           "（人确认后执行，机器不猜状态）",
+            })
+        to = row["to"]
+        if to is not None and to != row["_zone_dir"]:
+            problems.append({
+                "file": os.path.join("handoffs", row["_zone_dir"], f"{hid}.md"),
+                "field": "to",
+                "message": f"命名错位：frontmatter.to={to} 但文件在 "
+                           f"{row['_zone_dir']}/ 目录"
+                           "（metadata 以 frontmatter 为准，不影响读取）",
+            })
+
+    for hid, state in sorted(states.items()):
+        if hid in ids_on_disk:
+            continue  # 文件在（无论哪个目录）：幽灵不成立
+        status = state.get("status") or "pending"
+        if status not in ("pending", "re_consumed"):
+            continue  # consumed 豁免：可能已被 gc 移 .trash 或人工归档
+        problems.append({
+            "file": os.path.join("handoffs", state.get("to") or "?", f"{hid}.md"),
+            "field": hid,
+            "message": f"幽灵：有登记无文件（status: {status}）。inject 将 exit 3",
+        })
+
+    for item in skipped:  # L-2 坏行（read_events 收集，此处消费）
+        prefix = str(item.get("raw", ""))[:40]
+        problems.append({
+            "file": "index.jsonl",
+            "field": f"line {item.get('line', '?')}",
+            "message": f"损坏行跳过：{prefix}...",
+        })
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# show：合并视图渲染（重渲染为受限 yaml 文本，人读友好）
+# ---------------------------------------------------------------------------
+
+_ZONE_FIELD_ORDER = ("name", "display", "prefix", "prompt", "mode_hint",
+                     "model_hint", "inject_on_entry", "guards", "handoff_out")
+_YAML_PLAIN_FORBIDDEN_HEAD = "!&*-:?|>%@`'\"#,[]{}"
+
+
+def _yaml_scalar(value):
+    """渲染为 yaml 标量：bool 原样；字符串按需双引号（转义安全）。"""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    s = str(value)
+    if (s == "" or s[0] in _YAML_PLAIN_FORBIDDEN_HEAD or s != s.strip()
+            or ":" in s or "#" in s or "\n" in s):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s
+
+
+def render_zone_yaml(data):
+    """合并后定义 -> yaml 文本（受限 schema 重渲染；值级与源一致）。"""
+    out = []
+    for key in _ZONE_FIELD_ORDER:
+        if key not in data:
+            continue
+        value = data[key]
+        if key == "prompt" and isinstance(value, str):
+            out.append("prompt: |")
+            body = value[:-1] if value.endswith("\n") else value
+            for line in (body.split("\n") if body else []):
+                out.append("  " + line if line else "")
+            continue
+        if isinstance(value, dict):
+            out.append(f"{key}:")
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, list):
+                    if not sub_value:
+                        out.append(f"  {sub_key}: []")
+                    else:
+                        out.append(f"  {sub_key}:")
+                        # 单引号风格：正则模式零转义畸变，人读友好
+                        for item in sub_value:
+                            out.append(f"    - '{str(item).replace(chr(39), chr(39)*2)}'")
+                else:
+                    out.append(f"  {sub_key}: {_yaml_scalar(sub_value)}")
+            continue
+        out.append(f"{key}: {_yaml_scalar(value)}")
+    for key, value in data.items():  # 兜底（load 已挡未知字段）
+        if key in _ZONE_FIELD_ORDER:
+            continue
+        out.append(f"{key}: {_yaml_scalar(value)}")
+    return "\n".join(out) + "\n"
+
+
+def cmd_show(args):
+    try:
+        data = load_zone_def(args.zone_name)
+    except ZoneDefError as exc:
+        return fail("show", str(exc), EXIT_BAD_DEF, args.json)
+    text = render_zone_yaml(data)
+    if args.json:
+        return emit_ok("show", {"zone_yaml": text})
+    print(text, end="")
+    return EXIT_OK
+
+
+def cmd_doctor(args):
+    cwd = os.getcwd()
+    events, skipped = read_events(cwd)
+    problems = doctor_problems(cwd) + _consistency_problems(cwd, events, skipped)
+    if args.json:
+        return emit_ok("doctor", {"problems": problems})
+    if not problems:
+        print("OK")
+        return EXIT_OK
+    print(f"发现 {len(problems)} 个问题：")
+    for p in problems:
+        field = f" [{p['field']}]" if p.get("field") else ""
+        print(f"  {p['file']}{field} {p['message']}")
+    return EXIT_OK  # 附录 A：doctor 始终 exit 0，问题见输出/data
+
+
+# ---------------------------------------------------------------------------
+# handoff 生命周期引擎（§6.2 / §5 R-2·R-5 / §6.4 / §6.5）
+#
+#   register：<file> 校验 frontmatter 合法 → 索引登记 pending（M-1 无移动
+#             语义——文档已按 §6.2 直接写在最终路径，写入=登记原子，R-2）。
+#             重复 register 为安全 no-op（幂等，exit 0 + already 提示）。
+#   inject：<id> 查索引生命周期 → 打印全文 + consumed 事件（调用即消费）。
+#             已 consumed 默认拒绝 exit 3（R-5），--force 追加 re_consumed
+#             （状态不回退，P-4）。跨区消费允许（B-1：handoff 只是上下文包，
+#             by 如实记）。幽灵（有登记无文件）exit 3（§7.4）。
+#
+# frontmatter 为受限 flat 键值（§6.2 schema v1）：--- 分隔，值语法复用
+# zones yaml 受限标量（_parse_scalar）；tags 列表项为纯标量。子集外形态
+# （嵌套值 / 流式集合 / tab）抛 FrontmatterError，register 消费为 exit 2。
+# ---------------------------------------------------------------------------
+
+_HANDOFF_ID_RE = re.compile(r"^ho-\d{8}-[0-9a-z]{4}$")
+HANDOFF_FROM_ZONES = ZONES + ("unzoned",)  # L-3：from 允许 unzoned（来源不设限）
+_HEADING_RE = re.compile(r"^#(?!#)\s+(.+?)\s*$")
+
+
+class FrontmatterError(Exception):
+    """handoff frontmatter 解析失败（§6.2）；register 消费为 exit 2。"""
+
+
+def _fm_scalar(token, lineno):
+    """frontmatter 标量：复用 zones yaml 受限标量，错误统一为 FrontmatterError。"""
+    try:
+        return _parse_scalar(token, lineno)
+    except ZoneDefError as exc:
+        raise FrontmatterError(str(exc)) from None
+
+
+def parse_frontmatter(text):
+    """文档全文 -> (frontmatter dict, 正文行列表)。
+
+    §6.2：首行 `---` 至下一个 `---` 为机器层（flat 键值 + tags 列表），
+    之后 `# 标题` 起是人机共享层。子集外形态（键缩进 / 流式集合语法 /
+    列表项嵌套值 / 空值非列表）抛 FrontmatterError（受限解析器：明确报错
+    好过静默错读）。
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise FrontmatterError("第 1 行必须是 frontmatter 分隔符 `---`（§6.2）")
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        raise FrontmatterError("frontmatter 未闭合（缺结束 `---`）")
+
+    fm = {}
+    i = 1
+    while i < end:
+        raw = lines[i]
+        content = raw.strip()
+        lineno = i + 1
+        if not content or content.startswith("#"):
+            i += 1
+            continue
+        if raw[:1] in (" ", "\t"):
+            raise FrontmatterError(
+                f"第 {lineno} 行：frontmatter 只支持 flat 键值（发现缩进/嵌套）")
+        key, sep, rest = content.partition(":")
+        key = key.strip()
+        if not sep or not key:
+            raise FrontmatterError(
+                f"第 {lineno} 行：无法解析（期望 key: value）：{content[:40]}")
+        if key in fm:
+            raise FrontmatterError(f"第 {lineno} 行：键重复：{key}")
+        i += 1
+        rest = rest.strip()
+        if rest:
+            fm[key] = _fm_scalar(rest, lineno)
+            continue
+        # 值为空：期待 `- item` 列表（允许更深缩进；空行/注释行跳过）
+        items = []
+        while i < end:
+            item = lines[i].strip()
+            if not item or item.startswith("#"):
+                i += 1
+                continue
+            if not item.startswith("- "):
+                break
+            token = item[2:].strip()
+            if not token:
+                raise FrontmatterError(
+                    f"第 {i + 1} 行：列表项为空（期望 - item）")
+            if ": " in token or token.endswith(":"):
+                raise FrontmatterError(
+                    f"第 {i + 1} 行：列表项不支持嵌套值（期望纯标量 tag）：{item[:40]}")
+            items.append(_fm_scalar(token, i + 1))
+            i += 1
+        if not items:
+            raise FrontmatterError(
+                f"第 {lineno} 行：{key} 为空值（期待 `- item` 列表或 `[]`）")
+        fm[key] = items
+    return fm, lines[end + 1:]
+
+
+def validate_handoff_fm(fm):
+    """frontmatter dict -> 错误清单（§5 R-2：id/from/to/created 存在且合法）。
+
+    空清单 = 合法。tags 预留不消费（§6.2）；from 允许 unzoned（L-3），
+    to 必须是四区之一（文档落 handoffs/<to>/ 下）。
+    """
+    errors = []
+    hid = fm.get("id")
+    if hid is None:
+        errors.append("缺 id（形如 ho-20260907-a1b2）")
+    elif not isinstance(hid, str) or not _HANDOFF_ID_RE.match(hid):
+        errors.append(f"id 非法：{hid!r}（须形如 ho-<yyyymmdd>-<4位小写字母数字>）")
+    source = fm.get("from")
+    if source is None:
+        errors.append(f"缺 from（允许：{'/'.join(HANDOFF_FROM_ZONES)}）")
+    elif source not in HANDOFF_FROM_ZONES:
+        errors.append(f"from 非法：{source!r}（允许：{'/'.join(HANDOFF_FROM_ZONES)}）")
+    dest = fm.get("to")
+    if dest is None:
+        errors.append(f"缺 to（四区：{'/'.join(ZONES)}，文档应位于 handoffs/<to>/ 下）")
+    elif dest not in ZONES:
+        errors.append(f"to 非法：{dest!r}（四区封闭集合：{'/'.join(ZONES)}，to 不允许 unzoned）")
+    created = fm.get("created")
+    if created is None:
+        errors.append("缺 created（ISO8601，如 2026-09-07T17:20:00+08:00）")
+    elif not isinstance(created, str):
+        errors.append(f"created 非法：须为 ISO8601 字符串（得到 {type(created).__name__}）")
+    else:
+        try:
+            datetime.fromisoformat(created)
+        except ValueError:
+            errors.append(f"created 非法：无法按 ISO8601 解析（得到 {created!r}）")
+    return errors
+
+
+def _handoff_title(body_lines, hid):
+    """正文首个 # 一级标题 -> 事件 title（无则回退 id）。"""
+    for line in body_lines:
+        m = _HEADING_RE.match(line)
+        if m:
+            return m.group(1)
+    return hid
+
+
+def _handoff_event(hid, status, session_id, subtype):
+    """状态迁移事件（§7.2）：不携带 from/to/title，只迁移 status/by/subtype。"""
+    return {
+        "v": 1,
+        "ts": now_iso(),
+        "type": "handoff",
+        "id": hid,
+        "status": status,
+        "by": session_id,
+        "subtype": subtype,
+    }
+
+
+def cmd_register(args):
+    """zone register <file>（§5：校验通过才 append——写入=登记原子）。"""
+    cwd = os.getcwd()
+
+    # (1) 存在性
+    if not os.path.isfile(args.file):
+        return fail("register", f"文件不存在：{args.file}", EXIT_USAGE, args.json)
+
+    # (2) 路径防跨项目：resolve 后前缀校验（须在本项目 sidecar 的 handoffs/ 树内）
+    real_file = os.path.realpath(args.file)
+    real_root = os.path.realpath(handoffs_dir(cwd))
+    try:
+        inside = os.path.commonpath([real_file, real_root]) == real_root
+    except ValueError:  # 零重叠路径（理论防御）
+        inside = False
+    if not inside:
+        return fail(
+            "register",
+            f"文件不在本项目 handoffs 树内：{real_file}（应为 {real_root}/<to>/<id>.md，"
+            "防跨项目误登记，§7.1）",
+            EXIT_USAGE, args.json)
+
+    # (3) frontmatter 解析 + 字段校验（§6.2 schema v1）
+    try:
+        with open(real_file, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return fail("register", f"文件不可读：{exc}", EXIT_USAGE, args.json)
+    try:
+        fm, body_lines = parse_frontmatter(text)
+    except FrontmatterError as exc:
+        return fail("register", f"frontmatter 解析失败：{exc}", EXIT_USAGE, args.json)
+    errors = validate_handoff_fm(fm)
+    if errors:
+        return fail("register", "frontmatter 校验失败：" + "；".join(errors)
+                    + "——修复文档后重新 register（闭环在模型侧，R-2）",
+                    EXIT_USAGE, args.json)
+
+    hid = fm["id"]
+
+    # (4) 幂等：id 已在索引（任意状态）→ 安全 no-op
+    events, _ = read_events(cwd)
+    if hid in _replay_handoffs(events):
+        if args.json:
+            return emit_ok("register", {"id": hid, "path": real_file, "already": True})
+        print(f"zone: {hid} 已登记过（重复 register 是安全 no-op；"
+              f"消费请用 zone inject {hid}）", file=sys.stderr)
+        return EXIT_OK
+
+    # (5) 登记：append pending 事件（无移动语义，M-1；title 取正文 # 一级标题）
+    event = {
+        "v": 1,
+        "ts": now_iso(),
+        "type": "handoff",
+        "id": hid,
+        "from": fm["from"],
+        "to": fm["to"],
+        "status": "pending",
+        "title": _handoff_title(body_lines, hid),
+    }
+    append_event(cwd, event)
+
+    if args.json:
+        return emit_ok("register", {"id": hid, "path": real_file})
+    print(f"registered {hid}")
+    return EXIT_OK
+
+
+def _inject_output(args, state, status, body):
+    """inject 成功输出：--json 全量 data；否则打印文档全文。"""
+    if args.json:
+        return emit_ok("inject", {
+            "id": args.id,
+            "from": state.get("from"),
+            "to": state.get("to"),
+            "status": status,
+            "body": body,
+        })
+    sys.stdout.write(body)
+    return EXIT_OK
+
+
+def cmd_inject(args):
+    """zone inject <id> [--force]（§6.5：调用即消费；R-5：--force 逃生门）。"""
+    cwd = os.getcwd()
+
+    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not session_id:
+        return fail("inject", "缺少会话 id：--session <id> 或环境变量 CLAUDE_CODE_SESSION_ID",
+                    EXIT_USAGE, args.json)
+
+    # 索引重放：该 id 的合并状态（无事件 → exit 3）
+    events, _ = read_events(cwd)
+    state = _replay_handoffs(events).get(args.id)
+    if state is None:
+        return fail("inject", f"handoff 不在索引（未 register？）：{args.id}",
+                    EXIT_NOT_FOUND, args.json)
+
+    status = state.get("status")
+    if status != "pending" and not args.force:
+        return fail("inject",
+                    f"handoff {args.id} 已消费（status: {status}），状态不回退（P-4）——"
+                    f"重读全文请用 zone inject {args.id} --force",
+                    EXIT_NOT_FOUND, args.json)
+
+    # 全文：读 handoffs/<to>/<id>.md（幽灵=有登记无文件 → exit 3，§7.4）
+    path = os.path.join(handoffs_dir(cwd), state.get("to") or "", f"{args.id}.md")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError:
+        return fail("inject", f"幽灵 handoff：索引有 {args.id} 的登记但文件不存在（{path}）",
+                    EXIT_NOT_FOUND, args.json)
+
+    if status == "pending":
+        append_event(cwd, _handoff_event(args.id, "consumed", session_id, "inject"))
+        return _inject_output(args, state, "consumed", body)
+
+    # consumed/re_consumed + --force：追加 re_consumed（跨区允许，B-1：by 如实记）
+    append_event(cwd, _handoff_event(args.id, "re_consumed", session_id, "inject --force"))
+    return _inject_output(args, state, "re_consumed", body)
+
+
+# ---------------------------------------------------------------------------
+# pending 双源查询（§7.4 H-3：目录扫描 ∩ 索引状态）
+#
+#   pending 的真值 = 目录扫描（文件存在）∩ 索引状态（非 consumed/stale）。
+#   目录答"文件在不在"，索引答"生命周期到哪了"。行源永远是目录扫描：
+#     - 索引 pending → 正常行
+#     - 索引 consumed/re_consumed → 排除（文件虽在，生命周期已终）
+#     - 无登记（孤儿：模型写了文档但 register 失败/漏调）→ 视为 pending，
+#       状态列如实标 (unregistered)，不做自动登记（H-3：机器不猜状态）
+#     - 幽灵（有登记无文件）→ 不出行（doctor 范围，§7.4）
+#   stale 按 §6.4 B-3：created 起算 14 天未消费 → 状态列标 stale——渲染时
+#   派生显示，非存储状态；孤儿同样回退 frontmatter.created 判定（§7.4）。
+# ---------------------------------------------------------------------------
+
+STALE_DAYS = 14  # §6.4 B-3：created 起算 14 天
+
+
+def _scan_handoff_files(cwd, zone=None):
+    """目录扫描 handoffs/<zone>/ -> [handoff 行 dict（仅目录侧事实）]。
+
+    扫描区：--zone=Z 只扫 handoffs/Z/（目录不存在=空集）；省略则扫四区
+    目录（缺者跳过）。每文件读 frontmatter（id/from/to/created），从文件
+    名取 id 元数据、正文 # 一级标题取 title；解析失败的文件跳过（doctor
+    范围，不是 pending 的事）。frontmatter 值为准（§7.4 命名错位：
+    frontmatter.to ≠ 目录名 → doctor 报告，不影响本表读取）。
+    """
+    root = handoffs_dir(cwd)
+    zones = (zone,) if zone else ZONES
+    rows = []
+    for z in zones:
+        zdir = os.path.join(root, z)
+        if not os.path.isdir(zdir):
+            continue
+        for entry in sorted(os.listdir(zdir)):
+            if not entry.endswith(".md"):
+                continue
+            path = os.path.join(zdir, entry)
+            if not os.path.isfile(path):
+                continue
+            # 元数据取文件名 id（目录扫描侧唯一可信锚点；与 frontmatter
+            # id 冲突属 doctor 范围，此处不猜）
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    fm, body_lines = parse_frontmatter(fh.read())
+            except (FrontmatterError, OSError):
+                continue  # 损坏/不可读 → 跳过收集，doctor 报告
+            hid = entry[:-len(".md")]
+            rows.append({
+                "id": hid,
+                "from": fm.get("from"),
+                "to": fm.get("to"),
+                "created": fm.get("created"),
+                "title": _handoff_title(body_lines, hid),
+                "_zone_dir": z,  # 所在目录名（渲染 FROM→TO 用 frontmatter）
+            })
+    rows.sort(key=lambda r: r["created"] or "")
+    return rows
+
+
+def _derive_items(cwd, zone=None):
+    """目录扫描行 -> 附录 A items（目录源 ∩ 索引状态，§7.4 双源合并）。
+
+    每行状态列查索引回填（_replay_handoffs 现值）：无登记 → 孤儿
+    unregistered；consumed/re_consumed → 排除（pending 语义 = 未消费；
+    list 全量视图另行合并，不走本函数）。stale 派生不写事件。
+    """
+    events, _ = read_events(cwd)
+    states = _replay_handoffs(events)
+    now = datetime.now().astimezone()
+
+    items = []
+    for row in _scan_handoff_files(cwd, zone):
+        hid = row["id"]
+        status = "pending"
+        unregistered = False
+        if hid in states:
+            status = states[hid].get("status") or "pending"
+            if status in ("consumed", "re_consumed"):
+                continue  # pending 语义 = 未消费（不含生命周期已终的）；list 显式收
+        else:
+            unregistered = True  # 孤儿：有文件无登记（不自动登记，H-3）
+        items.append({
+            "id": hid,
+            "from": row["from"],
+            "to": row["to"],
+            "status": status,
+            "title": row["title"],
+            "created": row["created"],
+            "stale": _is_stale(row["created"], now),
+            "unregistered": unregistered,
+        })
+    return items
+
+
+def _is_stale(created, now=None):
+    """created + 14d < now（§6.4 B-3：渲染时派生，非存储状态）。
+
+    created 是孤儿行（frontmatter 直读）与已登记行共同的唯一时间源——
+    索引事件不带 created 字段，§7.4 孤儿判定回退 frontmatter.created。
+    created 缺失/非法 → 视为未 stale（显示层不因数据污点翻车）。
+    """
+    now = now or datetime.now().astimezone()
+    try:
+        then = datetime.fromisoformat(created)
+    except (TypeError, ValueError):
+        return False
+    deadline = then.astimezone() + timedelta(days=STALE_DAYS)
+    return deadline < now
+
+
+def _handoff_status_display(status, stale, unregistered):
+    """状态列渲染：生命周期状态 + 派生标注（§5 状态列口径）。"""
+    text = status or "-"
+    if stale:
+        text += " (stale)"
+    if unregistered:
+        text += " (unregistered)"
+    return text
+
+
+def _render_pending_table(items):
+    """pending 表（§5 列序：ID、状态、标题、FROM→TO、相对时间）——复用
+    _render_handoff_table，仅空集文案与无前导空行不同（pending 是独立输出，
+    list 的 handoff 段沿用空行分隔）。"""
+    _render_handoff_table(items, empty_text="（暂无未消费 handoff）",
+                          leading_blank=False)
+
+
+def cmd_pending(args):
+    """zone pending [--zone=Z]：未消费 handoff = 目录扫描 ∩ 索引状态（§7.4）。"""
+    if args.zone is not None and args.zone not in ZONES:
+        return fail("pending", f"未知区：{args.zone}（四区封闭集合：{'/'.join(ZONES)}）",
+                    EXIT_BAD_DEF, args.json)
+    items = _derive_items(os.getcwd(), args.zone)
+    if args.json:
+        return emit_ok("pending", {"items": [dict(it) for it in items]})
+    _render_pending_table(items)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# _check-guard（内部子命令，04-01；§9 PreToolUse 行 + GUARD-01/03）
+#
+#   `zone _check-guard write --path <p> [--session <id>]`——hook 薄封装的唯一
+#   guard 求值入口（M-5 单一实现）。链路：
+#     session 缺省读 CLAUDE_CODE_SESSION_ID → 无 → unzoned 放行（GUARD-03
+#     degrade-to-open：缺会话 id 不拦任何写入）
+#     → 索引 by sessionId 判区（§7.3；未登记 → unzoned 放行——同 repo 多
+#       worktree 并行不同区，源真相在索引，不从 cwd 推断）
+#     → 合并定义（Q-4 覆盖式合并）guards.deny_write_edit != true → 放行
+#     → true：path 对 allow_paths 逐模式 match_glob → 命中放行，否则 deny。
+#   exit 恒 0（决策走数据不走退出码，hook 消费 JSON；仅用法错误 exit 2、
+#   定义不可用 exit 4——退出码与"放行与否"无耦合）。
+# ---------------------------------------------------------------------------
+
+def _glob_segment_regex(segment):
+    """单段 pattern → 正则：* 段内任意（不跨 /），其余字面（re.escape）。"""
+    parts = ["[^/]*" if ch == "*" else re.escape(ch) for ch in segment]
+    return "".join(parts)
+
+
+def _glob_segments_match(pat_segs, path_segs):
+    """段列表匹配（带 memo 回溯）：`**` 独占一段 = 匹配任意段序列（含零段）。
+
+    **/handoffs/** 命中 /a/handoffs/b/c.md 与 /handoffs/x.md——`**/` 即要求
+    后随段出现在路径任意段（含首段，绝对路径的根空段由首 ** 吸收）。
+    """
+    memo = {}
+
+    def match(i, j):
+        key = (i, j)
+        if key in memo:
+            return memo[key]
+        if i == len(pat_segs):
+            result = j == len(path_segs)
+        elif pat_segs[i] == "**":
+            result = any(match(i + 1, k)
+                         for k in range(j, len(path_segs) + 1))
+        elif j < len(path_segs) and re.fullmatch(
+                _glob_segment_regex(pat_segs[i]), path_segs[j]):
+            result = match(i + 1, j + 1)
+        else:
+            result = False
+        memo[key] = result
+        return result
+
+    return match(0, 0)
+
+
+def match_glob(pattern, path):
+    """§8 allow_paths 模式匹配（纯 stdlib fnmatch 不够：** 需跨段语义）。
+
+    - `**` 独占一段：任意层目录段（含零段）
+    - `*`：段内任意（不跨 /）
+    - 其余字面（. 转义等按字面，不引入正则方言）
+    - pattern 不含 `/`（裸名，如 .gitignore）：按路径尾段（basename）匹配
+      ——B-4/D-001 语义：maint 写 repo 根 .gitignore 的放行场景
+    """
+    if not pattern:
+        return False
+    if "/" not in pattern:
+        return re.fullmatch(
+            _glob_segment_regex(pattern), os.path.basename(path)) is not None
+    return _glob_segments_match(pattern.split("/"), path.split("/"))
+
+
+def normalize_path(path):
+    """--path 规范化：~ 展开、去前导 ./（含重复）、压缩重复 /。
+
+    realpath 不必须——目标文件可以尚不存在，匹配靠模式段语义，不查文件系统。
+    """
+    path = os.path.expanduser(path or "")
+    path = re.sub(r"^(\./)+", "", path)
+    return re.sub(r"/{2,}", "/", path)
+
+
+def _guard_resolve_zone(args):
+    """guard 共用判区（§7.3 by sessionId；GUARD-03 degrade-to-open）。
+
+    返回 (zone or None, cwd)。无会话 id / 未登记 → None（调用方按 unzoned
+    放行，源真相在索引，不从 cwd 推断）。
+    """
+    cwd = os.getcwd()
+    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not session_id:
+        return None, cwd
+    events, _ = read_events(cwd)
+    ev = replay_sessions(events).get(session_id)
+    return (ev.get("zone") if ev else None), cwd
+
+
+def _guard_output(args, data):
+    """决策输出：--json 走附录 A data={decision,zone,pattern?}（04-01）。"""
+    if args.json:
+        return emit_ok("_check-guard", data)
+    line = f"{data['decision']} {data['zone']}"
+    if data.get("pattern"):
+        line += f" {data['pattern']}"
+    print(line)
+    return EXIT_OK
+
+
+def cmd_check_guard(args):
+    """`_check-guard <action>`：一次工具调用的 allow/deny 判定（GUARD-01..04）。
+
+    write（04-01）：deny_write_edit → allow_paths glob 豁免。
+    bash（04-02）：bash_block_patterns 逐条 re.search → 命中 deny 带模式。
+    链路共用：判区 by sessionId → 合并定义（Q-4）→ 区 guards 求值，
+    GUARD-03 degrade-to-open（无会话 id / 未登记 unzoned 一律放行），
+    exit 恒 0（决策走数据；仅用法错 exit 2、定义不可用 exit 4）。
+    """
+    if args.action == "write":
+        if not args.path:
+            return fail("_check-guard", "action=write 需要 --path <p>", EXIT_USAGE, args.json)
+        return _check_guard_write(args)
+    if args.action == "bash":
+        if args.command is None:
+            return fail("_check-guard", "action=bash 需要 --command <s>", EXIT_USAGE, args.json)
+        return _check_guard_bash(args)
+    return fail("_check-guard",
+                f"未知 guard 动作：{args.action}（当前支持 write / bash）",
+                EXIT_USAGE, args.json)
+
+
+def _check_guard_write(args):
+    zone, cwd = _guard_resolve_zone(args)
+    path = normalize_path(args.path)
+
+    if zone not in ZONES:  # 未登记 / 无会话 id → unzoned，GUARD-03 后半
+        return _guard_output(args, {"decision": "allow", "zone": "unzoned"})
+
+    try:
+        guards = (load_zone_def(zone, cwd) or {}).get("guards") or {}
+    except ZoneDefError as exc:
+        return fail("_check-guard", f"区定义不可用（{exc}）", EXIT_BAD_DEF, args.json)
+
+    if guards.get("deny_write_edit") is not True:
+        return _guard_output(args, {"decision": "allow", "zone": zone})
+
+    for pattern in guards.get("allow_paths") or []:
+        if isinstance(pattern, str) and match_glob(pattern, path):
+            return _guard_output(args, {"decision": "allow", "zone": zone})
+    return _guard_output(args, {"decision": "deny", "zone": zone, "pattern": path})
+
+
+def _check_guard_bash(args):
+    """`_check-guard bash --command <s>`（04-02，GUARD-02/04）。
+
+    bash_block_patterns（正则 list，§8.2 L-6）逐条 re.search on command
+    字符串——黑名单只拦已知危险形态，不枚举安全命令；空列表 → 自然 allow。
+    """
+    zone, cwd = _guard_resolve_zone(args)
+    command = args.command
+
+    if zone not in ZONES:  # 未登记 / 无会话 id → unzoned，GUARD-03（非 maint 不查）
+        return _guard_output(args, {"decision": "allow", "zone": "unzoned"})
+
+    try:
+        guards = (load_zone_def(zone, cwd) or {}).get("guards") or {}
+    except ZoneDefError as exc:
+        return fail("_check-guard", f"区定义不可用（{exc}）", EXIT_BAD_DEF, args.json)
+
+    for pattern in guards.get("bash_block_patterns") or []:
+        if isinstance(pattern, str):
+            try:
+                matched = re.search(pattern, command)
+            except re.error:  # 定义坏正则：跳过该条，不因一条坏全线崩（doctor 范围）
+                continue
+            if matched:
+                return _guard_output(args, {
+                    "decision": "deny", "zone": zone, "pattern": pattern})
+    return _guard_output(args, {"decision": "allow", "zone": zone})
+
+
+# ---------------------------------------------------------------------------
+# snapshot（§5 M-2）：core→maint 收尾链的现场块，纯机器产物
+#
+#   subprocess 调 git（--no-pager，项目 cwd）取四项事实：当前分支 /
+#   porcelain dirty 清单 / 最近 5 条 log / 全分支清单——拼 markdown 块
+#   （## Snapshot + 四小节），零 LLM 加工，/handoff 指令原样嵌入。
+#   非 git 目录（git 命令失败/非零）→ 单行 'Snapshot: 非 git 仓库'。
+# ---------------------------------------------------------------------------
+
+def _git(args_list, cwd=None):
+    """跑一条 git 子命令 → (stdout 文本, ok)；非零/找不到 git → ("", False)。"""
+    try:
+        proc = subprocess.run(
+            ["git", "--no-pager"] + args_list,
+            capture_output=True, text=True, cwd=cwd,
+        )
+    except OSError:  # git 不在 PATH 等
+        return "", False
+    if proc.returncode != 0:
+        return "", False
+    return proc.stdout, True
+
+
+def _snapshot_body(cwd=None):
+    """git 现场块全文（非 git 仓库 → 'Snapshot: 非 git 仓库' 单行）。"""
+    branch, ok = _git(["branch", "--show-current"], cwd)
+    if not ok:
+        return "Snapshot: 非 git 仓库"
+    branch = branch.strip() or "(detached HEAD)"
+    status_out, _ = _git(["status", "--porcelain"], cwd)
+    log_out, _ = _git(["log", "--oneline", "-5"], cwd)
+    branches_out, _ = _git(["branch", "-a", "--format=%(refname:short)"], cwd)
+
+    status_lines = [ln for ln in status_out.splitlines() if ln.strip()]
+    log_lines = [ln.strip() for ln in log_out.splitlines() if ln.strip()]
+    branch_lines = [ln.strip() for ln in branches_out.splitlines() if ln.strip()]
+
+    lines = ["## Snapshot", "",
+             "### 当前分支", "", f"{branch}", "",
+             "### 未提交改动（porcelain）", ""]
+    lines.extend(status_lines if status_lines else ["（无）"])
+    lines.append("")
+    lines.extend(["### 最近提交（log -5）", ""])
+    lines.extend(log_lines if log_lines else ["（无）"])
+    lines.append("")
+    lines.extend(["### 分支清单（branch -a）", ""])
+    lines.extend(branch_lines if branch_lines else ["（无）"])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_snapshot(args):
+    body = _snapshot_body(os.getcwd())
+    if args.json:
+        return emit_ok("snapshot", {"body": body})
+    sys.stdout.write(body)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# gc（§6.4 B-3 / §7.1 .trash）：stale 文档移入 handoffs/.trash/，永不删除
+#
+#   扫描四区目录全部 .md → parse_frontmatter 取 created → 判过期：
+#   created + stale_days 天 < now（B-3 语义：以 created 起算，不论
+#   pending 与否——过期即移）→ shutil.move 到 handoffs/.trash/
+#   （同名冲突加尾缀 -1/-2）。绝不删除（无任何 unlink 调用；手工清空
+#   trash 是人的事）。stale_days 沿用 _scan_handoff_files 跳过坏文件
+#   的口径：解析失败的文档不属于本命令的事，doctor 报告。
+# ---------------------------------------------------------------------------
+
+def _trash_dedupe_path(trash_dir, filename):
+    """.trash/ 内目标路径：同名冲突在去扩展名后加 -1/-2 尾缀（.md 保留）。"""
+    base, ext = os.path.splitext(filename)
+    candidate = os.path.join(trash_dir, filename)
+    n = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(trash_dir, f"{base}-{n}{ext}")
+        n += 1
+    return candidate
+
+
+def cmd_gc(args):
+    cwd = os.getcwd()
+    now = datetime.now().astimezone()
+    root = handoffs_dir(cwd)
+
+    moved, kept = 0, 0
+    trash_dir = os.path.join(root, ".trash")
+    for zone in ZONES:
+        zdir = os.path.join(root, zone)
+        if not os.path.isdir(zdir):
+            continue
+        for entry in sorted(os.listdir(zdir)):
+            if not entry.endswith(".md"):
+                continue
+            path = os.path.join(zdir, entry)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    fm, _body = parse_frontmatter(fh.read())
+            except (FrontmatterError, OSError):
+                continue  # 解析失败的文件：不动（doctor 范围），宁可堆积不可误移
+            created = fm.get("created")
+            stale = False
+            try:
+                stale = datetime.fromisoformat(created) + timedelta(days=args.stale_days) < now
+            except (TypeError, ValueError):
+                stale = False  # created 缺失/非法：视为未过期（显示层不翻车口径）
+            if not stale:
+                kept += 1
+                continue
+            os.makedirs(trash_dir, exist_ok=True)  # 分目录新建而 .trash/ 未建时防 move 吞目录
+            dest = _trash_dedupe_path(trash_dir, entry)
+            shutil.move(path, dest)
+            moved += 1
+
+    if args.json:
+        return emit_ok("gc", {"moved": moved, "kept": kept})
+    print(f"moved {moved}, kept {kept}")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# argparse 骨架
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    # --json：附录 A 要求所有子命令支持；全局位置与子命令后位置均接受
+    # （parents 共享旗标，避免逐个重复声明）
+    json_flag = argparse.ArgumentParser(add_help=False)
+    json_flag.add_argument(
+        "--json", action="store_true",
+        help="按附录 A 契约输出单行 JSON",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="zone",
+        description="zoning 插件命令行（chore/core/discuss/maint 四区）",
+        parents=[json_flag],
+    )
+    parser.add_argument("--version", action="version", version=f"zone {VERSION}")
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+
+    def add(name, help):
+        return sub.add_parser(name, help=help, parents=[json_flag])
+
+    # 内部子命令（M-5：hook 薄封装调用；help 低调，不占正常命令列表的注意力）
+    p = sub.add_parser("_register-session", parents=[json_flag],
+                       help="（内部命令，hook 使用）")
+    p.set_defaults(func=cmd_register_session)
+
+    p = sub.add_parser("_zone-prompt", parents=[json_flag],
+                       help="（内部命令，hook 使用）")
+    p.add_argument("zone_name", metavar="zone",
+                   help="区名（chore/core/discuss/maint）")
+    p.set_defaults(func=cmd_zone_prompt)
+
+    p = sub.add_parser("_zap-title", parents=[json_flag],
+                       help="（内部命令，hook 使用）")
+    p.set_defaults(func=cmd_zap_title)
+
+    p = sub.add_parser("_check-guard", parents=[json_flag],
+                       help="（内部命令，hook 使用）")
+    p.add_argument("action", metavar="action",
+                   help="guard 动作（write / bash）")
+    p.add_argument("--path",
+                   help="Write/Edit 的目标文件路径（action=write 必填）")
+    p.add_argument("--command",
+                   help="Bash 的命令字符串（action=bash 必填）")
+    p.add_argument("--session", help="会话 id（缺省取 CLAUDE_CODE_SESSION_ID）")
+    p.set_defaults(func=cmd_check_guard)
+
+    p = add("which", "查会话所属区（人类诊断命令）")
+    p.add_argument("--session", help="会话 id（缺省取 CLAUDE_CODE_SESSION_ID）")
+    p.add_argument("--cwd", help="项目目录")
+    p.set_defaults(func=cmd_which)
+
+    p = add("list", "列 handoff 与会话索引摘要")
+    p.add_argument("--zone", dest="zone", help="限定区（chore/core/discuss/maint）")
+    p.set_defaults(func=cmd_list)
+
+    p = add("pending", "仅未消费 handoff（目录扫描 ∩ 索引状态）")
+    p.add_argument("--zone", dest="zone", help="限定区（chore/core/discuss/maint）")
+    p.set_defaults(func=cmd_pending)
+
+    p = add("register", "校验 frontmatter 合法并登记索引")
+    p.add_argument("file", help="handoff 文档路径")
+    p.set_defaults(func=cmd_register)
+
+    p = add("snapshot", "生成 core→maint 收尾链的现场块（纯机器产物）")
+    p.set_defaults(func=cmd_snapshot)
+
+    p = add("inject", "打印 handoff 全文并标记 consumed")
+    p.add_argument("id", help="handoff id（如 ho-20260907-a1b2）")
+    p.add_argument("--force", action="store_true",
+                   help="已 consumed 文档的逃生门（追加 re_consumed 事件）")
+    p.add_argument("--session", help="消费会话 id（缺省取 CLAUDE_CODE_SESSION_ID）")
+    p.set_defaults(func=cmd_inject)
+
+    p = add("gc", "stale 文档移入 handoffs/.trash/")
+    p.add_argument("--stale-days", type=int, default=14, metavar="N",
+                   help="stale 阈值天数（缺省 14）")
+    p.set_defaults(func=cmd_gc)
+
+    p = add("doctor", "校验 zone 定义与存储一致性（目录 × 索引 × 坏行）")
+    p.set_defaults(func=cmd_doctor)
+
+    p = add("show", "某区定义的最终合并视图")
+    p.add_argument("zone_name", metavar="zone",
+                   help="区名（chore/core/discuss/maint）")
+    p.set_defaults(func=cmd_show)
+
+    p = add("title", "归一化 + 前缀判定")
+    p.add_argument("title", help="会话标题字符串")
+    p.set_defaults(func=cmd_title)
+
+    return parser
+
+
+def _fix_global_json(argv):
+    """全局前置 --json 归一化到子命令后（附录 A：两位置均接受）。
+
+    argparse 双 parents（全局 + 子命令同 dest）解析怪癖：`zone --json pending`
+    里全局 flag 已消耗，但子 parser 的 store_true 默认 False 覆盖同一 dest
+    → json=False。归一化：--json 从全局位移到子命令名后，单处定义生效。
+    """
+    if argv and argv[0] == "--json":
+        rest = argv[1:]
+        if rest:  # 空命令行交给 argparse 报用法错
+            return [rest[0], "--json"] + rest[1:]
+    return argv
+
+
+def main(argv=None):
+    parser = build_parser()
+    if argv is None:
+        argv = sys.argv[1:]
+    args = parser.parse_args(_fix_global_json(argv))
+    if getattr(args, "func", None) is None:
+        parser.print_help(sys.stderr)
+        return EXIT_USAGE
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

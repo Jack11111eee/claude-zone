@@ -1,0 +1,27 @@
+name: maint
+display: 版本维护
+prefix: "--maint"
+prompt: |
+  你处于版本维护区。这里只做维护性 git 操作：分支整理、merge、gitignore、
+  远程配置、tag 等。
+  不改代码。高危命令另有护栏。改代码的工作属于核心区。
+mode_hint: default
+model_hint: default
+inject_on_entry:
+  zone_prompt: true
+  pending_handoff_scan: true
+guards:
+  deny_write_edit: true
+  bash_block_patterns:
+    - 'git push\s+.*--force(?!\S)'
+    - 'git reset\s+--hard'
+    - 'git branch\s+(-D|--delete --force)\b'
+    - 'git clean\s+.*-f'
+    - 'git checkout\s+\S+\s+--\s'
+    - 'git reflog\s+expire'
+    - 'git gc\s+--prune=now'
+  allow_paths:
+    - "**/handoffs/**"
+    - ".gitignore"
+    - "**/.claude/zones/**"
+handoff_out: ""

@@ -1,0 +1,19 @@
+name: core
+display: 核心
+prefix: "--core"
+prompt: |
+  你处于核心区。这里的任务复杂、非线性：完整构建项目、重构架构、改数据库
+  表关系等。
+  先计划后动手（建议 plan mode 起步）。改动前重读本区约束。执行中遇到需要
+  重新讨论的规格问题，用 /handoff 回讨论区，不要在执行中自行变更范围。
+  完成后可用 /handoff 将分支现场交给版本维护区。
+mode_hint: plan
+model_hint: opus
+inject_on_entry:
+  zone_prompt: true
+  pending_handoff_scan: true
+guards:
+  deny_write_edit: false
+  bash_block_patterns: []
+  allow_paths: []
+handoff_out: core_to_maint

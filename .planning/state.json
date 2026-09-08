@@ -1,0 +1,43 @@
+{
+  "contract": "1.0.0",
+  "flavor": "core",
+  "milestone": "v1.0 — zoning 全量交付（Phases 1-6）",
+  "phases": [
+    {
+      "number": "1",
+      "name": "M0 底座",
+      "status": "complete"
+    },
+    {
+      "number": "2",
+      "name": "M1 注入",
+      "status": "complete"
+    },
+    {
+      "number": "3",
+      "name": "M2 旗舰 handoff",
+      "status": "complete"
+    },
+    {
+      "number": "4",
+      "name": "M3 护栏",
+      "status": "complete"
+    },
+    {
+      "number": "5",
+      "name": "M4 其余链路",
+      "status": "complete"
+    },
+    {
+      "number": "6",
+      "name": "M5 巡视与糖",
+      "status": "complete"
+    }
+  ],
+  "next": {
+    "command": "/gsd:progress",
+    "label": "Show progress",
+    "reason": "Unsure of state — showing progress"
+  },
+  "updated_at": "2026-09-08T07:25:08.948Z"
+}

@@ -1,0 +1,18 @@
+name: discuss
+display: 讨论
+prefix: "--discuss"
+prompt: |
+  你处于讨论区。这里的任务是讨论与细化：项目需求、架构、实现效果、修正方案。
+  本区禁止修改源码（另有护栏强制）。讨论的终点是写 handoff，不是改文件：
+  讨论收敛后用 /handoff 将决策、开放问题、范围边界交给核心区实施。
+mode_hint: default
+model_hint: default
+inject_on_entry:
+  zone_prompt: true
+  pending_handoff_scan: true
+guards:
+  deny_write_edit: true
+  bash_block_patterns: []
+  allow_paths:
+    - "**/handoffs/**"
+handoff_out: discuss_to_core
