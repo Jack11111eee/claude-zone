@@ -80,11 +80,16 @@ Plans:
   4. `zone pending` 列表与目录∩索引双源一致：孤儿 (unregistered) 如实标注；幽灵 exit 3
   5. 上游 handoff 链路确认 fake frontmatter 时 register 拒绝且提示模型修复（闭环留模型侧）
 
-**Plans**: 4 plans
+**Plans**: 1/4 plans executed
 
 Plans:
 
-- [ ] 03-01: handoff schema + register/inject（frontmatter 校验、生命周期事件、--force 语义）
+- [x] 03-01-PLAN.md
+- [ ] 03-02-PLAN.md
+- [ ] 03-03-PLAN.md
+- [ ] 03-04-PLAN.md
+
+- [x] 03-01: handoff schema + register/inject（frontmatter 校验、生命周期事件、--force 语义）
 - [ ] 03-02: pending 双源查询（目录扫描∩索引状态、stale 派生、孤儿标注）
 - [ ] 03-03: doctor（四区定义校验 + 孤儿/幽灵/命名错位 + 索引损坏行容忍）
 - [ ] 03-04: /handoff skill + discuss_to_core 模板 + SessionStart/UPS pending 探测提示行
@@ -156,7 +161,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 |-------|----------------|--------|-----------|
 | 1. M0 底座 | 3/3 | Complete    | 2026-09-08 |
 | 2. M1 注入 | 2/2 | Complete    | 2026-09-08 |
-| 3. M2 旗舰 handoff | 0/4 | Not started | - |
+| 3. M2 旗舰 handoff | 1/4 | In Progress|  |
 | 4. M3 护栏 | 0/2 | Not started | - |
 | 5. M4 其余链路 | 0/2 | Not started | - |
 | 6. M5 巡视与糖 | 0/2 | Not started | - |
