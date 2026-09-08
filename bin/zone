@@ -11,6 +11,8 @@
        + 内部子命令 `_register-session`（M-5：hook 薄封装的登记入口）。
 02-01：受限 yaml 解析器（纯标准库，§8 schema 子集）+ `show`（覆盖式合并视图，
        Q-4 深合并）+ `doctor`（内置定义校验 / P-6 第五区 / B-6 未知字段）。
+02-02：内部子命令 `_zone-prompt`（prompt 从合并定义取全文）+ `_zap-title`
+       （/zone 换区：transcript 首条用户消息取名 M-3 + source:command 事件）。
 其余子命令（pending/register/snapshot/inject/gc）仅声明骨架，后续 plan 填实。
 """
 
@@ -303,6 +305,135 @@ def cmd_register_session(args):
         return emit_ok("_register-session", {
             "zone": zone, "title": title, "sessionId": session_id, "appended": True,
         })
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# _zone-prompt（内部子命令，M-5：hook 注入的唯一 prompt 来源）
+# ---------------------------------------------------------------------------
+
+def zone_prompt_text(zone, repo_root=None):
+    """区名 -> prompt 全文（经 load_zone_def 合并管线，§4 M-5 单一实现）。
+
+    未知区 / 解析失败抛 ZoneDefError。
+    """
+    data = load_zone_def(zone, repo_root)
+    prompt = data.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ZoneDefError(f"prompt 字段缺失或为空（{zone}）")
+    return prompt
+
+
+def cmd_zone_prompt(args):
+    try:
+        prompt = zone_prompt_text(args.zone_name)
+    except ZoneDefError as exc:
+        return fail("_zone-prompt", str(exc), EXIT_BAD_DEF, args.json)
+    if args.json:
+        return emit_ok("_zone-prompt", {"zone": args.zone_name, "prompt": prompt})
+    print(prompt, end="")  # prompt 本身以 \n 收尾（块标量 clip）
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# _zap-title（内部子命令，M-3/M-5：/zone 换区的 title 修订 + 索引登记）
+# ---------------------------------------------------------------------------
+
+_ZONE_PROMPT_RE = re.compile(r"^/zone\s+(\S+)$")
+
+
+def _first_user_text(transcript_path):
+    """transcript jsonl -> 首条用户消息文本（M-3：title 名称来源）。
+
+    逐行 json.loads（坏行跳过），取首条 type=="user" 的 message.content：
+    字符串直接用；列表取首个含 text 的块（tool_result 干扰排除）。找不到、
+    路径缺失或不可读 -> None。
+    """
+    if not transcript_path:
+        return None
+    try:
+        fh = open(transcript_path, encoding="utf-8")
+    except (OSError, TypeError):
+        return None
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict) or obj.get("type") != "user":
+                continue
+            content = (obj.get("message") or {}).get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = next((b.get("text") for b in content
+                             if isinstance(b, dict) and isinstance(b.get("text"), str)), None)
+            else:
+                text = None
+            if text is not None and text.strip():
+                return text.strip()
+    return None
+
+
+def _title_from_transcript(text, zone):
+    """首条用户消息 -> 修订 title：截 ~40 字、去换行，前缀补 --<zone>。"""
+    if text:
+        name = re.sub(r"\s+", " ", text).strip()[:40]
+    else:
+        name = datetime.now().strftime("%m-%d")  # 空/解析失败 → --<zone> <MM-DD>
+    return f"--{zone} {name}"
+
+
+def cmd_zap_title(args):
+    """stdin JSON {session_id, cwd, transcript_path, zone(?)} -> 换区登记。
+
+    目标区：stdin zone 字段（hook 透传），缺省从 stdin prompt 的 /zone 参数取。
+    归一化（[core]→--core）后 append session 事件（source: "command"，§4 换区
+    = 追加事件、后事件覆盖前事件）。输出修订后的 title。
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return fail("_zap-title", "stdin 不是合法 JSON", EXIT_USAGE, args.json)
+
+    session_id = payload.get("session_id") or ""
+    cwd = payload.get("cwd") or os.getcwd()
+    zone = payload.get("zone")
+    if not zone:
+        m = _ZONE_PROMPT_RE.match(payload.get("prompt") or "")
+        zone = m.group(1) if m else None
+    if not zone or zone not in ZONES:
+        return fail("_zap-title",
+                    f"目标区缺失或非法：{zone!r}（stdin zone 字段或 prompt /zone 参数，四区：{'/'.join(ZONES)}）",
+                    EXIT_USAGE, args.json)
+
+    # M-3：名称=transcript 首条用户消息（截 ~40 去）；[zone] 旧语法残留在此归一化
+    title = _title_from_transcript(_first_user_text(payload.get("transcript_path")), zone)
+    name_zone, rest, _ = parse_title(title)
+    if name_zone != zone or not rest:  # 截断撞不出前缀歧义，防御归一化
+        title = f"--{zone} {rest or title}"
+
+    event = {
+        "v": 1,
+        "ts": now_iso(),
+        "type": "session",
+        "sessionId": session_id,
+        "zone": zone,
+        "title": title,
+        "cwd": cwd,
+        "source": "command",  # §7.2：/zone 补救归属可审计来源
+    }
+    append_event(cwd, event)
+
+    if args.json:
+        return emit_ok("_zap-title", {
+            "zone": zone, "title": title, "sessionId": session_id, "source": "command",
+        })
+    print(title)
     return EXIT_OK
 
 
@@ -987,6 +1118,16 @@ def build_parser():
     p = sub.add_parser("_register-session", parents=[json_flag],
                        help="（内部命令，hook 使用）")
     p.set_defaults(func=cmd_register_session)
+
+    p = sub.add_parser("_zone-prompt", parents=[json_flag],
+                       help="（内部命令，hook 使用）")
+    p.add_argument("zone_name", metavar="zone",
+                   help="区名（chore/core/discuss/maint）")
+    p.set_defaults(func=cmd_zone_prompt)
+
+    p = sub.add_parser("_zap-title", parents=[json_flag],
+                       help="（内部命令，hook 使用）")
+    p.set_defaults(func=cmd_zap_title)
 
     p = add("which", "查会话所属区（人类诊断命令）")
     p.add_argument("--session", help="会话 id（缺省取 CLAUDE_CODE_SESSION_ID）")
