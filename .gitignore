@@ -1,3 +1,4 @@
 .DS_Store
 .sandbox-test/
 bin/__pycache__/
+.planning/REQUIREMENTS.md
