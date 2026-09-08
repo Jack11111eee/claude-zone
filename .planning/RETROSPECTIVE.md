@@ -49,6 +49,34 @@ created: 2026-09-08
 
 ### Deferred / v1.x Maintenance
 
-- 3 个 hook 硬编码 zone 文案（LABELS）vs yaml display 双词表漂移——当前一致，收敛到单源。
-- `git clean -Xfd` / `git  clean`（双空格）等非常规形态不在七条正则内——盖层可收紧。
-- V-2（picker 输 `--core` 过滤）待用户 30 秒人工核验。
+- 3 个 hook 硬编码 zone 文案（LABELS）vs yaml display 双词表漂移——当前一致，收敛到单源。→ **v1.1 已解决（Phase 7）**
+- `git clean -Xfd` / `git  clean`（双空格）等非常规形态不在七条正则内——盖层可收紧。→ **v1.1 已解决（Phase 9，DESIGN §8.2 已同步）**
+- V-2（picker 输 `--core` 过滤）待用户 30 秒人工核验。→ 仍开放
+
+## Milestone: v1.1 — 收尾与加固
+
+**Shipped:** 2026-09-08 | **Phases:** 4 | **Plans:** 4 | **Tasks:** 16 | **Plugin:** 1.1.0
+
+### What Was Built
+
+v1.0 三条技术债 + 发布收口：hook 文案 yaml display 单源化（LABELS 退役）、SessionEnd lastSeen（stub → 实装，复用 session schema + kind 标记使 list/doctor 零改动）、护栏加固（实测绕过面根除 + 24 断言测试入库，repo 首个 tests/）、版本语义化。
+
+### What Worked
+
+- **复用既有 schema 而非新增类型**（lastSeen 用 type:session+kind）——重放/列表/doctor 全零改动面，一次设计省三处修改。
+- **缺口实测定案再派发**：Phase 9 开工前主会话先真跑 `_check-guard` 确认绕过形态与根因，plan 里就带着精确根因（-Xfd 无独立 -f 子串、字面单空格），子代理一次过。
+- **升级核查走真实安装路径**（uninstall+install）而非只改文件——确认 1.1.0 真着床，三抽查立证新护栏/新链路随升级生效。
+
+### What Was Inefficient
+
+- 两个子代理各自独立发现 macOS TMPDIR `/var` symlink 的 cwd/slug 不一致问题（guard 测试假阴性）——经验未跨子代理传递，记到 plan 提示里第二次就免了（P9 子代理已在脚本内注释）。
+
+### Key Lessons
+
+- 「技术债里程碑」小而值：4 phases 一天内闭环，每条 REQ 都有真会话或真安装路径证据，v1.1 = 更硬的 v1.0 而非新功能面。
+- 版本号首个真实发布不必空跳 1.0.0——tag 与 plugin.json 一致（1.1.0）优先于理论净化。
+
+### Cost Observations
+
+- 三个实施子代理 ~90min 总耗时，全部一次过；主会话复测+真会话验收 ~40min。
+
