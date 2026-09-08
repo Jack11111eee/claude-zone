@@ -55,8 +55,12 @@ zoning 是一个 Claude Code 插件，为同一项目的会话引入「功能分
 |----------|-----------|---------|
 | 35 项设计拍板（D/P/Q/R/A/B 系列）+ H/M/L 审查修复 | 六轮讨论收敛，DESIGN.md v1.2 定稿 | ✓ Good |
 | M2=discuss→core handoff 全链路 = v0.1 | 旗舰功能垂直切片，先端到端走通 | — Pending |
-| 垂直切片里程碑 M0~M5 | 横切先框架后填肉会长时间无可感知行为 | — Pending |
-| GSD 托管实施：skill 调用被环境分类器阻断 → orchestrator 直接执行工作流 | 分类器间歇故障是环境问题；产物格式对齐 GSD 规范，流程不变形 | ⚠️ Revisit（若分类器恢复可切回 skill 调用） |
+| 垂直切片里程碑 M0~M5 | 横切先框架后填肉会长时间无可感知行为 | ✓ Good（M0 已端到端） |
+| GSD 托管实施：skill 调用被环境分类器阻断 → orchestrator 直接执行工作流 | 分类器间歇故障是环境问题；产物格式对齐 GSD 规范，流程不变形 | ✓ Good（Phase 1 走通） |
+| maint push 黑名单正则 `--force(?!\S)` 而非裸 `--force` | 裸形式误伤 `--force-with-lease`（L-6 明言放行的保护性操作） | ✓ Good |
+| YAML 黑名单正则用单引号标量 | 双引号标量下 `\s` 非法转义、`\b` 变退格——PyYAML 直接解析失败 | ✓ Good |
+| 验收/基准测试一律 `ZONING_HOME=$(mktemp -d)` 隔离 | 曾有一次裸跑污染真实索引（已清理）| ✓ Good |
+| zoning 插件经本地 marketplace（`.claude-plugin/marketplace.json`）自举安装 | 真会话验收要求插件实际生效；marketplace 指向仓库自身 | ✓ Good（M0 E2E 立证） |
 
 ---
 *Last updated: 2026-09-08 after project init (auto mode from DESIGN.md)*
