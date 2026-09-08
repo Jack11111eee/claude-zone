@@ -107,11 +107,14 @@ Plans:
   4. unzoned 会话（无前缀、无 /zone）→ 一切放行（零打扰）
   5. 判区 by sessionId（同 repo 双终端不同区互不串扰）
 
-**Plans**: 2 plans
+**Plans**: 1/2 plans executed
 
 Plans:
 
-- [ ] 04-01: PreToolUse Write/Edit hook（deny_write_edit + allow_paths glob 匹配）
+- [x] 04-01-PLAN.md
+- [ ] 04-02-PLAN.md
+
+- [x] 04-01: PreToolUse Write/Edit hook（deny_write_edit + allow_paths glob 匹配）
 - [ ] 04-02: PreToolUse Bash hook（bash_block_patterns 正则、判区 by sessionId、maint 黑名单）
 
 ### Phase 5: M4 其余链路
@@ -162,6 +165,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 1. M0 底座 | 3/3 | Complete    | 2026-09-08 |
 | 2. M1 注入 | 2/2 | Complete    | 2026-09-08 |
 | 3. M2 旗舰 handoff | 4/4 | Complete    | 2026-09-08 |
-| 4. M3 护栏 | 0/2 | Not started | - |
+| 4. M3 护栏 | 1/2 | In Progress|  |
 | 5. M4 其余链路 | 0/2 | Not started | - |
 | 6. M5 巡视与糖 | 0/2 | Not started | - |
