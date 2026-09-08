@@ -23,3 +23,16 @@
 - README 落地 + cz 语法 zsh -n 通过 + 24 REQ 全覆盖终审。
 
 ---
+
+## v1.1 收尾与加固 (Shipped: 2026-09-08)
+
+**Phases completed:** 4 phases, 4 plans
+
+**Key accomplishments:**
+
+- hook 文案单源化：LABELS 硬编码退役，展示文案经 zones/*.yaml display 单源派生（M-5 精神补完）。
+- SessionEnd lastSeen 落地：轻量 append 事件（stub → 实装），zone list 相对时间反映会话最近活动。
+- Bash 护栏加固：七条正则 git\s+ 前缀统一 + clean 组合旗标收紧（-Xfd 等绕过面关闭），24 断言测试矩阵入库。
+- 发布收口：版本语义化 1.1.0、DESIGN §8.2 快照同步、升级核查。
+
+---

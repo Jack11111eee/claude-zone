@@ -61,6 +61,8 @@ claude plugin marketplace add <本仓库路径或 marketplace 引用>
 claude plugin install zoning@zoning
 ```
 
+版本：v1.1.0（版本号自 v1.1 起语义化）。v1.0 = 全量功能交付；v1.1 = hook 文案单源化、SessionEnd lastSeen、护栏加固（`git clean` 组合旗标与多空格形态）。
+
 数据位置（全部本地文件，无 daemon 无 SQLite）：
 
 ```

@@ -310,13 +310,13 @@ handoff_out: discuss_to_core   # 引用模板名（链路矩阵 §6.3）
 
 ```yaml
 bash_block_patterns:   # 拦已知危险形态，不枚举全部安全命令（无法穷举且误伤）
-  - "git push\s+.*--force"       # 含 --force-with-lease? 否，--force-with-lease 是保护性操作，放行
-  - "git reset\s+--hard"
-  - "git branch\s+(-D|--delete --force)\b"
-  - "git clean\s+.*-f"
-  - "git checkout\s+\S+\s+--\s"  # 路径级丢弃
-  - "git reflog\s+expire"
-  - "git gc\s+--prune=now"
+  - "git\s+push\s+.*--force(?!\S)"  # 含 --force-with-lease? 否，--force-with-lease 是保护性操作，放行；v1.1 git\s+ 前缀统一
+  - "git\s+reset\s+--hard"
+  - "git\s+branch\s+(-D|--delete --force)\b"
+  - "git\s+clean\s+.*-[a-zA-Z]*f"   # v1.1：字母组合旗标含 f 即拦（-Xfd/-fx 等），-n 干跑不受误伤
+  - "git\s+checkout\s+\S+\s+--\s"   # 路径级丢弃
+  - "git\s+reflog\s+expire"
+  - "git\s+gc\s+--prune=now"
 ```
 
 匹配对象是 Bash tool 调用的 command 字符串，正则命中 → PreToolUse deny 且提示"维护区护栏：高危 git 操作需人工确认，请改用安全形态或换区执行"。
