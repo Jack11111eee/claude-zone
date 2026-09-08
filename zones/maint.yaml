@@ -13,13 +13,13 @@ inject_on_entry:
 guards:
   deny_write_edit: true
   bash_block_patterns:
-    - 'git push\s+.*--force(?!\S)'
-    - 'git reset\s+--hard'
-    - 'git branch\s+(-D|--delete --force)\b'
-    - 'git clean\s+.*-f'
-    - 'git checkout\s+\S+\s+--\s'
-    - 'git reflog\s+expire'
-    - 'git gc\s+--prune=now'
+    - 'git\s+push\s+.*--force(?!\S)'
+    - 'git\s+reset\s+--hard'
+    - 'git\s+branch\s+(-D|--delete --force)\b'
+    - 'git\s+clean\s+.*-[a-zA-Z]*f'
+    - 'git\s+checkout\s+\S+\s+--\s'
+    - 'git\s+reflog\s+expire'
+    - 'git\s+gc\s+--prune=now'
   allow_paths:
     - "**/handoffs/**"
     - ".gitignore"
