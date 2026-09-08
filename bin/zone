@@ -34,6 +34,10 @@
        清单四小节，纯机器产物，非 git 目录优雅降级单行）+ `gc`
        （§6.4 B-3：created 起算 stale_days 天过期即移入 handoffs/.trash/，
        不论 pending 与否；shutil.move 永不 unlink，同名冲突加 -1/-2 尾缀）。
+08-01：内部子命令 `_touch`（§9 SessionEnd 行：轻量 lastSeen——按
+       sessionId 在索引查现值，已登记（四区）append 复用 type:"session"
+       schema 的 kind:"lastSeen" 事件，重放 last-wins 使 `list` 相对时间
+       自动最新；unzoned/未登记/无 sid 零动作零输出，SESS-01/02）。
 """
 
 import argparse
@@ -480,6 +484,62 @@ def cmd_zap_title(args):
             "zone": zone, "title": title, "sessionId": session_id, "source": "command",
         })
     print(title)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# _touch（内部子命令，M-5：SessionEnd hook 的薄封装 lastSeen 入口）
+# ---------------------------------------------------------------------------
+
+def cmd_touch(args):
+    """stdin JSON -> lastSeen 事件 append（轻量 lastSeen，§9 SessionEnd 行）。
+
+    stdin 字段（hook 实际转发 session_id / cwd）。判区：按 sessionId 在
+    索引现值里查（replay_sessions，§7.2 last-wins）——该 sid 现值为四区
+    之一才 append；unzoned / 未登记 / 无 sid → 不 append 不输出（SESS-02
+    零打扰，与 guard 同口径）。事件复用 type:"session" schema 加
+    kind:"lastSeen" 标记：重放天然 last-wins，list 相对时间自动最新，
+    读取方零改动。title 从现值继承（lastSeen 是心跳不是改名）。
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return fail("_touch", "stdin 不是合法 JSON", EXIT_USAGE, args.json)
+
+    session_id = payload.get("session_id") or ""
+    cwd = payload.get("cwd") or os.getcwd()
+
+    if not session_id:
+        # 无 sid：判区依据缺席，零动作（SESS-02 口径，不猜）
+        if args.json:
+            return emit_ok("_touch", {"zone": "unzoned", "appended": False})
+        return EXIT_OK
+
+    events, _ = read_events(cwd)
+    ev = replay_sessions(events).get(session_id)
+    if ev is None or ev.get("zone") not in ZONES:
+        # 未登记 / unzoned：静默零动作（§3：silent plain CC）
+        if args.json:
+            return emit_ok("_touch", {"zone": "unzoned", "appended": False})
+        return EXIT_OK
+
+    event = {
+        "v": 1,
+        "ts": now_iso(),
+        "type": "session",
+        "kind": "lastSeen",
+        "sessionId": session_id,
+        "zone": ev.get("zone"),
+        "title": ev.get("title") or "",
+        "cwd": cwd,
+        "source": "session_end",
+    }
+    append_event(cwd, event)
+
+    if args.json:
+        return emit_ok("_touch", {
+            "zone": ev.get("zone"), "sessionId": session_id, "appended": True,
+        })
     return EXIT_OK
 
 
@@ -2024,6 +2084,10 @@ def build_parser():
     p = sub.add_parser("_zap-title", parents=[json_flag],
                        help="（内部命令，hook 使用）")
     p.set_defaults(func=cmd_zap_title)
+
+    p = sub.add_parser("_touch", parents=[json_flag],
+                       help="（内部命令，hook 使用）")
+    p.set_defaults(func=cmd_touch)
 
     p = sub.add_parser("_check-guard", parents=[json_flag],
                        help="（内部命令，hook 使用）")
