@@ -22,6 +22,10 @@
 03-03：doctor 一致性检查（§7.4 孤儿/幽灵/命名错位三类 + §7.2 L-2 索引
        坏行报告；read_events 坏行收集扩为 {line, raw} 供 doctor 消费，
        其余读取方不受影响——只报告，不修复，机器不猜状态）。
+04-01：`_check-guard write`（§9 PreToolUse 行：判区 by sessionId → 合并
+       定义 deny_write_edit → allow_paths glob carve-out 自实现，
+       ** 跨段 / * 段内 / 其余字面——纯 stdlib fnmatch 不够；GUARD-03
+       degrade-to-open：无会话 id / 未登记 unzoned 一律放行，exit 恒 0）。
 其余子命令（snapshot/gc）仅声明骨架，后续 plan 填实。
 """
 
@@ -1633,6 +1637,128 @@ def cmd_pending(args):
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------------
+# _check-guard（内部子命令，04-01；§9 PreToolUse 行 + GUARD-01/03）
+#
+#   `zone _check-guard write --path <p> [--session <id>]`——hook 薄封装的唯一
+#   guard 求值入口（M-5 单一实现）。链路：
+#     session 缺省读 CLAUDE_CODE_SESSION_ID → 无 → unzoned 放行（GUARD-03
+#     degrade-to-open：缺会话 id 不拦任何写入）
+#     → 索引 by sessionId 判区（§7.3；未登记 → unzoned 放行——同 repo 多
+#       worktree 并行不同区，源真相在索引，不从 cwd 推断）
+#     → 合并定义（Q-4 覆盖式合并）guards.deny_write_edit != true → 放行
+#     → true：path 对 allow_paths 逐模式 match_glob → 命中放行，否则 deny。
+#   exit 恒 0（决策走数据不走退出码，hook 消费 JSON；仅用法错误 exit 2、
+#   定义不可用 exit 4——退出码与"放行与否"无耦合）。
+# ---------------------------------------------------------------------------
+
+def _glob_segment_regex(segment):
+    """单段 pattern → 正则：* 段内任意（不跨 /），其余字面（re.escape）。"""
+    parts = ["[^/]*" if ch == "*" else re.escape(ch) for ch in segment]
+    return "".join(parts)
+
+
+def _glob_segments_match(pat_segs, path_segs):
+    """段列表匹配（带 memo 回溯）：`**` 独占一段 = 匹配任意段序列（含零段）。
+
+    **/handoffs/** 命中 /a/handoffs/b/c.md 与 /handoffs/x.md——`**/` 即要求
+    后随段出现在路径任意段（含首段，绝对路径的根空段由首 ** 吸收）。
+    """
+    memo = {}
+
+    def match(i, j):
+        key = (i, j)
+        if key in memo:
+            return memo[key]
+        if i == len(pat_segs):
+            result = j == len(path_segs)
+        elif pat_segs[i] == "**":
+            result = any(match(i + 1, k)
+                         for k in range(j, len(path_segs) + 1))
+        elif j < len(path_segs) and re.fullmatch(
+                _glob_segment_regex(pat_segs[i]), path_segs[j]):
+            result = match(i + 1, j + 1)
+        else:
+            result = False
+        memo[key] = result
+        return result
+
+    return match(0, 0)
+
+
+def match_glob(pattern, path):
+    """§8 allow_paths 模式匹配（纯 stdlib fnmatch 不够：** 需跨段语义）。
+
+    - `**` 独占一段：任意层目录段（含零段）
+    - `*`：段内任意（不跨 /）
+    - 其余字面（. 转义等按字面，不引入正则方言）
+    - pattern 不含 `/`（裸名，如 .gitignore）：按路径尾段（basename）匹配
+      ——B-4/D-001 语义：maint 写 repo 根 .gitignore 的放行场景
+    """
+    if not pattern:
+        return False
+    if "/" not in pattern:
+        return re.fullmatch(
+            _glob_segment_regex(pattern), os.path.basename(path)) is not None
+    return _glob_segments_match(pattern.split("/"), path.split("/"))
+
+
+def normalize_path(path):
+    """--path 规范化：~ 展开、去前导 ./（含重复）、压缩重复 /。
+
+    realpath 不必须——目标文件可以尚不存在，匹配靠模式段语义，不查文件系统。
+    """
+    path = os.path.expanduser(path or "")
+    path = re.sub(r"^(\./)+", "", path)
+    return re.sub(r"/{2,}", "/", path)
+
+
+def _guard_output(args, data):
+    """决策输出：--json 走附录 A data={decision,zone,pattern?}（04-01）。"""
+    if args.json:
+        return emit_ok("_check-guard", data)
+    line = f"{data['decision']} {data['zone']}"
+    if data.get("pattern"):
+        line += f" {data['pattern']}"
+    print(line)
+    return EXIT_OK
+
+
+def cmd_check_guard(args):
+    """`_check-guard write`：一次 Write/Edit 的 allow/deny 判定（GUARD-01/03）。"""
+    if args.action != "write":
+        return fail("_check-guard",
+                    f"未知 guard 动作：{args.action}（当前仅 write；bash 在 04-02）",
+                    EXIT_USAGE, args.json)
+    cwd = os.getcwd()
+    path = normalize_path(args.path)
+
+    # GUARD-03 前半：连会话 id 都没有 → 无从判区 → 放行（degrade-to-open）
+    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    zone = None
+    if session_id:
+        events, _ = read_events(cwd)
+        ev = replay_sessions(events).get(session_id)
+        if ev:
+            zone = ev.get("zone")
+
+    if zone not in ZONES:  # 未登记 / 无会话 id → unzoned，GUARD-03 后半
+        return _guard_output(args, {"decision": "allow", "zone": "unzoned"})
+
+    try:
+        guards = (load_zone_def(zone, cwd) or {}).get("guards") or {}
+    except ZoneDefError as exc:
+        return fail("_check-guard", f"区定义不可用（{exc}）", EXIT_BAD_DEF, args.json)
+
+    if guards.get("deny_write_edit") is not True:
+        return _guard_output(args, {"decision": "allow", "zone": zone})
+
+    for pattern in guards.get("allow_paths") or []:
+        if isinstance(pattern, str) and match_glob(pattern, path):
+            return _guard_output(args, {"decision": "allow", "zone": zone})
+    return _guard_output(args, {"decision": "deny", "zone": zone, "pattern": path})
+
+
 def make_stub(cmd_name):
     def stub(args):
         return fail(
@@ -1682,6 +1808,15 @@ def build_parser():
     p = sub.add_parser("_zap-title", parents=[json_flag],
                        help="（内部命令，hook 使用）")
     p.set_defaults(func=cmd_zap_title)
+
+    p = sub.add_parser("_check-guard", parents=[json_flag],
+                       help="（内部命令，hook 使用）")
+    p.add_argument("action", metavar="action",
+                   help="guard 动作（write；bash 在 04-02）")
+    p.add_argument("--path", required=True,
+                   help="Write/Edit 的目标文件路径（tool_input.file_path）")
+    p.add_argument("--session", help="会话 id（缺省取 CLAUDE_CODE_SESSION_ID）")
+    p.set_defaults(func=cmd_check_guard)
 
     p = add("which", "查会话所属区（人类诊断命令）")
     p.add_argument("--session", help="会话 id（缺省取 CLAUDE_CODE_SESSION_ID）")
